@@ -1,107 +1,319 @@
 """
 ScentMatch — personality quiz → fragrance recommender.
 
-Backend: sentence-transformers embeddings + cosine similarity (unchanged).
+Backend: sentence-transformers embeddings + cosine similarity.
 Frontend: 9-question personality quiz that compiles answers into a semantic
           search query passed to the embedding backend.
+Dataset: Fragrantica dataset (fra_cleaned.csv).
 """
 
+import ast
+import re
 import pandas as pd
 import numpy as np
 import streamlit as st
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import os
+import requests
+import anthropic
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ─────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────
 
-SAMPLE_DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "fragrances.csv")
+FRA_PATH        = os.path.join(os.path.dirname(__file__), "data", "fra_cleaned.csv")
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-TOP_K = 5
+TOP_K           = 5
 
 
 # ─────────────────────────────────────────────
-# Backend — unchanged from original
+# Backend
 # ─────────────────────────────────────────────
+
+def _parse_list_col(val) -> str:
+    """Convert a stringified Python list like \"['a', 'b']\" to comma-joined text."""
+    if not val or (isinstance(val, float)):
+        return ""
+    s = str(val).strip()
+    try:
+        parsed = ast.literal_eval(s)
+        if isinstance(parsed, list):
+            return ", ".join(str(x) for x in parsed)
+    except Exception:
+        pass
+    return re.sub(r"[\[\]'\"]", "", s).strip()
+
 
 def load_data() -> pd.DataFrame:
-    """
-    Load the fragrance dataset.
-    Returns a DataFrame with at minimum: name, brand, notes, accords, description.
-    """
-    kaggle_path = os.path.join(os.path.dirname(__file__), "data", "fra_cleaned.csv")
+    """Load and normalise the Fragrantica dataset."""
+    if not os.path.exists(FRA_PATH):
+        raise FileNotFoundError(
+            f"Fragrantica dataset not found at {FRA_PATH}.\n"
+            "Run: python precompute_embeddings.py"
+        )
 
-    if os.path.exists(kaggle_path):
-        df = pd.read_csv(kaggle_path)
-        df.columns = df.columns.str.lower().str.replace(" ", "_")
-        rename_map = {
-            "fragrance_name": "name",
-            "fragrance": "name",
-            "perfume": "name",
-            "main_accords": "accords",
-            "top_notes": "notes",
-        }
-        df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns}, inplace=True)
-        for col in ["name", "brand", "notes", "accords", "description"]:
-            if col not in df.columns:
-                df[col] = ""
-            df[col] = df[col].fillna("").astype(str)
-        return df
+    df = pd.read_csv(FRA_PATH, encoding="latin-1", on_bad_lines="skip", sep=None, engine="python")
+    df.columns = df.columns.str.strip()
 
-    df = pd.read_csv(SAMPLE_DATA_PATH)
-    for col in ["name", "brand", "notes", "accords", "description"]:
-        df[col] = df[col].fillna("").astype(str)
+    rename_map = {
+        "Perfume":      "name",
+        "Brand":        "brand",
+        "Gender":       "gender",
+        "Rating Value": "rating",
+        "Rating Count": "reviews",
+    }
+    df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns}, inplace=True)
+
+    # Ratings use European comma-decimal format ("3,42" → "3.42")
+    if "rating" in df.columns:
+        df["rating"] = df["rating"].astype(str).str.replace(",", ".", regex=False).str.strip()
+
+    # Combine Top/Middle/Base into a labelled notes string
+    note_cols = [c for c in ["Top", "Middle", "Base"] if c in df.columns]
+    df["notes"] = df[note_cols].fillna("").apply(
+        lambda row: "  ·  ".join(
+            f"{col}: {val.strip()}" for col, val in zip(note_cols, row) if str(val).strip()
+        ),
+        axis=1,
+    )
+
+    # Combine mainaccord columns into a comma-separated string
+    accord_cols = [c for c in df.columns if c.startswith("mainaccord")]
+    df["accords"] = df[accord_cols].fillna("").apply(
+        lambda row: ", ".join(str(v).strip() for v in row if str(v).strip()),
+        axis=1,
+    )
+
+    # Gender already lowercase in Fragrantica: "women" / "men" / "unisex"
+    if "gender" in df.columns:
+        df["gender"] = df["gender"].str.lower().str.strip().fillna("unisex")
+    else:
+        df["gender"] = "unisex"
+
+    for col in ["name", "brand", "rating", "reviews", "notes", "accords", "url"]:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str).str.strip()
+
+    df = df[df["name"] != ""].reset_index(drop=True)
+    print(f"[load_data] Fragrantica products loaded: {len(df):,}")
     return df
 
 
 def build_corpus(df: pd.DataFrame) -> list[str]:
-    """Concatenate key fields per fragrance into one embeddable string."""
+    """Build embeddable text from name, brand, all note columns, accords, and country."""
     corpus = []
+    note_cols = [c for c in ["Top", "Middle", "Base"] if c in df.columns]
     for _, row in df.iterrows():
-        text = (
-            f"Fragrance: {row['name']}. "
-            f"Brand: {row['brand']}. "
-            f"Notes: {row['notes']}. "
-            f"Accords: {row['accords']}. "
-            f"{row['description']}"
-        )
-        corpus.append(text)
+        parts = [row["name"], row["brand"]]
+        # Labeled notes string ("Top: X · Middle: Y · Base: Z")
+        if row.get("notes"):
+            parts.append(row["notes"])
+        # Raw parsed notes — repeat ingredient names for denser keyword signal
+        for col in note_cols:
+            raw = _parse_list_col(row.get(col, ""))
+            if raw:
+                parts.append(raw)
+        if row.get("accords"):
+            parts.append(row["accords"])
+        country = str(row.get("Country", "") or "").strip()
+        if country:
+            parts.append(country)
+        corpus.append(" ".join(p for p in parts if p))
     return corpus
 
 
-@st.cache_resource(show_spinner="Loading embedding model…")
+CACHE_PATH = os.path.join(os.path.dirname(__file__), "embeddings_cache.npy")
+PKL_PATH   = os.path.join(os.path.dirname(__file__), "data", "fra_processed.pkl")
+
+
+@st.cache_resource(show_spinner="Loading model…")
 def load_model() -> SentenceTransformer:
-    """Download (first run) and cache the sentence-transformer model."""
     return SentenceTransformer(EMBEDDING_MODEL)
 
 
-@st.cache_data(show_spinner="Computing fragrance embeddings…")
-def compute_embeddings(corpus: tuple[str, ...]) -> np.ndarray:
+@st.cache_resource(show_spinner="Loading fragrances…")
+def load_data_and_embeddings():
     """
-    Embed every fragrance description once and cache the result.
-    Accepts a tuple (not list) because st.cache_data needs hashable args.
-    Returns shape (n_fragrances, embedding_dim).
+    Load DataFrame + embeddings from pre-computed cache if available,
+    otherwise compute on the fly and save for next time.
     """
-    model = load_model()
-    return model.encode(list(corpus), convert_to_numpy=True, show_progress_bar=False)
+    if os.path.exists(PKL_PATH) and os.path.exists(CACHE_PATH):
+        df         = pd.read_pickle(PKL_PATH)
+        embeddings = np.load(CACHE_PATH)
+        return df, embeddings
+
+    # First-run fallback: compute and save
+    df         = load_data()
+    corpus     = build_corpus(df)
+    model      = load_model()
+    embeddings = model.encode(corpus, convert_to_numpy=True, show_progress_bar=False)
+    np.save(CACHE_PATH, embeddings)
+    df.to_pickle(PKL_PATH)
+    return df, embeddings
 
 
-def recommend(query: str, df: pd.DataFrame, embeddings: np.ndarray, top_k: int = 5):
-    """
-    Embed the user's query and return the top_k most similar fragrances.
-    1. Embed query → shape (1, dim)
-    2. Cosine similarity vs all fragrance embeddings
-    3. Return top_k rows + scores
-    """
-    model = load_model()
-    query_vec = model.encode([query], convert_to_numpy=True)
-    scores = cosine_similarity(query_vec, embeddings)[0]
-    top_indices = np.argsort(scores)[::-1][:top_k]
-    results = df.iloc[top_indices].copy()
-    results["similarity"] = scores[top_indices]
+def recommend(
+    query: str,
+    df: pd.DataFrame,
+    embeddings: np.ndarray,
+    gender: str = "Show me everything",
+    top_k: int = 5,
+):
+    full_query = query
+
+    # ── Gender hard-filter ──
+    if gender != "Show me everything" and "gender" in df.columns:
+        allowed = {"men"} if gender == "Men's" else {"women"}
+        # include unisex always
+        mask = df["gender"].isin(allowed | {"unisex"})
+        filt_df  = df[mask].reset_index(drop=True)
+        filt_emb = embeddings[mask.values]
+    else:
+        filt_df  = df
+        filt_emb = embeddings
+
+    # ── Men's: exclude feminine-skewing unisex products and boost genuine men's ──
+    if gender == "Men's":
+        _MENS_EXCLUSIONS = [
+            "jo malone", "kayali", "blossom", "honey", "juicy", "rose",
+            "floral", "peony", "cherry", "lace", "bridal", "nude",
+        ]
+        combined = (filt_df["name"] + " " + filt_df["brand"]).str.lower()
+        exclude_mask = combined.apply(
+            lambda s: any(term in s for term in _MENS_EXCLUSIONS)
+        ) & (filt_df["gender"] == "unisex")
+        filt_emb = filt_emb[~exclude_mask.values]
+        filt_df  = filt_df[~exclude_mask].reset_index(drop=True)
+
+    model     = load_model()
+    query_vec = model.encode([full_query], convert_to_numpy=True)
+    scores    = cosine_similarity(query_vec, filt_emb)[0]
+
+    # ── Men's: boost genuine men's products so they rank above unisex ──
+    if gender == "Men's" and "gender" in filt_df.columns:
+        scores = scores.copy()
+        scores[filt_df["gender"].values == "men"] += 0.05
+
+    # ── Debug: print query + top-10 scores to terminal ──
+    print(f"\n[DEBUG] Query ({len(full_query)} chars):\n  {full_query[:300]}")
+    print(f"[DEBUG] Gender filter: {gender}  |  Pool size: {len(filt_df)}")
+    print("[DEBUG] Top 10 scores:")
+    top10 = np.argsort(scores)[::-1][:10]
+    for rank, idx in enumerate(top10, 1):
+        print(f"  {rank:2d}. {filt_df.iloc[idx]['name'][:40]:40s}  {filt_df.iloc[idx]['brand'][:20]:20s}  {scores[idx]:.4f}")
+    print(f"[DEBUG] Score range (top-10): {scores[top10[-1]]:.4f} – {scores[top10[0]]:.4f}\n")
+
+    # ── Diversity: pool top-20, deduplicate by brand, take top_k ──
+    pool_size = min(top_k * 4, len(filt_df))
+    pool_idx  = np.argsort(scores)[::-1][:pool_size]
+    pool_df   = filt_df.iloc[pool_idx].copy()
+    pool_df["similarity"] = scores[pool_idx]
+
+    seen_brands: set[str] = set()
+    deduped: list[pd.Series] = []
+    for _, row in pool_df.iterrows():
+        brand = row["brand"].lower().strip()
+        if brand not in seen_brands:
+            seen_brands.add(brand)
+            deduped.append(row)
+        if len(deduped) >= top_k:
+            break
+
+    results = pd.DataFrame(deduped).reset_index(drop=True)
     return results
+
+
+# ─────────────────────────────────────────────
+# Community insight layer (Reddit → Claude)
+# ─────────────────────────────────────────────
+
+def _fetch_reddit_texts(fragrance_name: str, brand: str) -> list[str]:
+    """Search r/fragrance for posts about this fragrance and return raw text snippets."""
+    query = f"{fragrance_name} {brand}"
+    params = {"q": query, "limit": 8, "sort": "top", "t": "all", "restrict_sr": 1}
+    headers = {"User-Agent": "ScentMatch/1.0 (fragrance recommendation app)"}
+    try:
+        r = requests.get(
+            "https://www.reddit.com/r/fragrance/search.json",
+            params=params, headers=headers, timeout=5,
+        )
+        r.raise_for_status()
+        texts = []
+        for post in r.json()["data"]["children"]:
+            d = post["data"]
+            if d.get("title"):
+                texts.append(d["title"])
+            body = d.get("selftext", "").strip()
+            if body and len(body) > 40:
+                texts.append(body[:500])
+        return texts
+    except Exception:
+        return []
+
+
+def _summarize_with_claude(fragrance_name: str, texts: list[str]) -> str:
+    """
+    Turn raw community text into one or two natural sentences using Claude Haiku.
+    Haiku is intentionally chosen here — this runs once per result card per search,
+    so cost matters. Falls back silently if ANTHROPIC_API_KEY is not set.
+    """
+    if not texts:
+        return ""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return ""
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        combined = "\n".join(texts[:6])
+        response = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=120,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Based on these fragrance enthusiast discussions about {fragrance_name}, "
+                    "write 1-2 natural sentences describing how wearers experience it and what makes it "
+                    "distinctive. Third person, present tense. No attribution, no quotes, no 'people say' "
+                    "— just flowing descriptive prose.\n\n"
+                    f"Discussions:\n{combined}"
+                ),
+            }],
+        )
+        return response.content[0].text.strip()
+    except Exception:
+        return ""
+
+
+def fetch_all_summaries(results_df: pd.DataFrame) -> dict[str, str]:
+    """
+    Fetch Reddit data and generate Claude summaries for all result fragrances in parallel.
+    Results are stored in st.session_state to avoid re-fetching on Streamlit reruns.
+    """
+    cache = st.session_state.setdefault("summary_cache", {})
+
+    def fetch_one(name: str, brand: str) -> tuple[str, str]:
+        key = f"{name}::{brand}"
+        if key in cache:
+            return name, cache[key]
+        texts  = _fetch_reddit_texts(name, brand)
+        summary = _summarize_with_claude(name, texts)
+        cache[key] = summary
+        return name, summary
+
+    summaries: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {
+            pool.submit(fetch_one, row["name"], row["brand"]): row["name"]
+            for _, row in results_df.iterrows()
+        }
+        for future in as_completed(futures):
+            name, summary = future.result()
+            summaries[name] = summary
+
+    return summaries
 
 
 # ─────────────────────────────────────────────
@@ -222,60 +434,101 @@ def derive_scent_profile(answers: list) -> str:
     return _SCENT_PROFILES.get((env, palate), "The Scent Seeker")
 
 
-def compile_query(answers: list) -> str:
+_ENVIRONMENT_MAP = {
+    "Dense forest":          "woody mossy earthy vetiver oakmoss green dark",
+    "Open ocean":            "aquatic marine fresh ozonic citrus light clean",
+    "Urban rooftop at night":"smoky amber leather dark woody musk urban",
+    "Desert at sunrise":     "dry warm spicy resinous amber incense arid",
+    "Garden after rain":     "floral green fresh petrichor soft dewy rose",
+}
+
+_PALATE_MAP = {
+    "Fresh & bright":      "citrus bergamot mint grapefruit light fresh clean",
+    "Warm & rich":         "vanilla amber sandalwood spice dark chocolate gourmand",
+    "Somewhere in between":"woody musk balanced moderate clean warm",
+    "Depends on my mood":  "versatile fresh woody",
+}
+
+_MOOD_KEYWORD_MAP = [
+    (["comfort", "cozy", "warm"],           "vanilla musk amber soft"),
+    (["confident", "bold", "strong"],        "oud leather woody spicy intense"),
+    (["fresh", "clean", "light"],            "citrus aquatic bergamot clean"),
+    (["mysterious", "dark", "deep"],         "oud smoky resinous dark amber"),
+    (["natural", "earthy", "outdoors"],      "vetiver moss green woody earth"),
+    (["sweet", "dessert", "food"],           "vanilla gourmand caramel praline"),
+    (["floral", "flowers", "garden"],        "rose jasmine peony iris floral"),
+    (["ocean", "beach", "sea", "water"],     "marine aquatic salt fresh"),
+    (["rain"],                               "petrichor green fresh ozonic"),
+    (["coffee", "cafe", "bookshop"],         "warm woody tobacco vanilla"),
+    (["wood", "forest", "trees"],            "cedar sandalwood vetiver pine"),
+    (["citrus", "fruit", "lemon", "orange"], "bergamot citrus grapefruit"),
+]
+
+_AGE_MAP = {
+    "18-24": "fresh light citrus clean modern",
+    "25-34": "",
+    "35-44": "complex woody amber sophisticated",
+    "45+":   "rich classic oriental deep sillage",
+}
+
+_AUDIENCE_MAP = {
+    "Mostly for others": "sillage projection bold lasting",
+    "Mostly for myself": "skin scent subtle personal intimate",
+    "Both equally":      "moderate balanced",
+}
+
+
+def build_fragrance_query(answers: list, age: str = "") -> str:
     """
-    Turn the 9 quiz answers into one natural-language paragraph.
-    This paragraph is passed directly to the embedding model as the search query.
-    Skipped questions get a neutral filler so the sentence still reads naturally.
+    Translate raw quiz answers into a fragrance-vocabulary-enriched query string.
+    Returns: "[original compiled answers]. Fragrance profile: [translated terms]"
     """
-    a = [x or "something hard to define" for x in answers]
+    a = [x or "" for x in answers]
 
-    palate = a[4]
-    if "fresh" in palate.lower():
-        palate_desc = "fresh and bright"
-    elif "warm" in palate.lower():
-        palate_desc = "warm and rich"
-    elif "in between" in palate.lower():
-        palate_desc = "balanced, somewhere between fresh and warm"
-    else:
-        palate_desc = "varied depending on the mood"
+    # ENVIRONMENT (answers[3])
+    env_terms = _ENVIRONMENT_MAP.get(a[3], "")
 
-    audience = a[6]
-    if "others" in audience.lower():
-        audience_desc = "worn for others — to be noticed and leave an impression"
-    elif "myself" in audience.lower():
-        audience_desc = "worn for themselves, a private and personal pleasure"
-    else:
-        audience_desc = "worn for both themselves and others equally"
+    # PALATE (answers[4]) — partial match because options carry extra parenthetical text
+    palate_terms = ""
+    for key, val in _PALATE_MAP.items():
+        if key.lower() in a[4].lower():
+            palate_terms = val
+            break
 
-    style = a[7]
-    if "signature" in style.lower():
-        style_desc = "a single defining signature scent they can be known for"
-    elif "rotating" in style.lower():
-        style_desc = "a rotating wardrobe of scents tuned to different moods"
-    else:
-        style_desc = "either a signature or a rotating wardrobe"
+    # MOOD/INTENTION — scan all open-text answers
+    text_blob = " ".join([a[0], a[1], a[2], a[5], a[8]]).lower()
+    mood_terms = [
+        terms for keywords, terms in _MOOD_KEYWORD_MAP
+        if any(kw in text_blob for kw in keywords)
+    ]
 
-    return (
-        f"Someone who loves the smell of {a[0]}. "
-        f"In social situations they tend to {a[1]}. "
-        f"Their everyday aesthetic is {a[2]}. "
-        f"They feel most at home in a {a[3]} kind of environment. "
-        f"They're drawn to {palate_desc} scents. "
-        f"They want people around them to feel {a[5]}. "
-        f"Their fragrance is {audience_desc}. "
-        f"They want {style_desc}. "
-        f"They want to smell like someone who {a[8]}."
+    # AGE
+    age_terms = _AGE_MAP.get(age, "")
+
+    # AUDIENCE (answers[6])
+    audience_terms = _AUDIENCE_MAP.get(a[6], "")
+
+    translated = " ".join(
+        t for t in [env_terms, palate_terms, " ".join(mood_terms), age_terms, audience_terms]
+        if t
     )
+
+    raw_answers = ". ".join(x for x in a if x.strip())
+    return f"{raw_answers}. Fragrance profile: {translated}".strip()
+
+
+def compile_query(answers: list, age: str = "") -> str:
+    return build_fragrance_query(answers, age=age)
 
 
 def reset_quiz():
     """Clear all quiz state so the app returns to the intro screen."""
     st.session_state.step = 0
     st.session_state.answers = [None] * 9
+    st.session_state.pop("demo_age", None)
+    st.session_state.pop("demo_gender", None)
     st.session_state.pop("results_df", None)
     st.session_state.pop("results_query", None)
-    # Clear any lingering widget values so inputs don't pre-fill on restart
     for i in range(1, 10):
         st.session_state.pop(f"q{i}_text", None)
         st.session_state.pop(f"q{i}_choice", None)
@@ -369,6 +622,9 @@ def inject_css():
             color: #b5afa8 !important;
             font-weight: 300 !important;
         }
+        /* Hide "Press Enter to apply" hint */
+        div[data-testid="stTextInput"] small,
+        [data-testid="InputInstructions"] { display: none !important; }
 
         /* ── Radio options: clean separator rows ── */
         div[data-testid="stRadio"] > div { gap: 0; }
@@ -466,20 +722,20 @@ def inject_css():
             display: block;
         }
 
-        /* ── Result card ── */
+        /* ── Result card — white card on cream background ── */
         .result-card {
-            border: none;
-            border-bottom: 1px solid #DDD8D2;
-            padding: 26px 0;
-            background: transparent;
+            background: #ffffff;
+            border-radius: 12px;
+            padding: 24px 26px 20px 26px;
+            margin-bottom: 16px;
+            box-shadow: 0 1px 10px rgba(0,0,0,0.06), 0 0 1px rgba(0,0,0,0.04);
         }
-        .result-card:first-of-type { border-top: 1px solid #DDD8D2; }
 
         .card-top {
             display: flex;
             justify-content: space-between;
             align-items: baseline;
-            margin-bottom: 4px;
+            margin-bottom: 2px;
         }
         .card-name {
             font-family: 'Cormorant Garamond', Georgia, serif;
@@ -508,22 +764,63 @@ def inject_css():
             text-transform: uppercase;
             font-weight: 400;
         }
-        .card-notes {
-            font-family: 'Inter', sans-serif;
-            font-size: 0.83rem;
-            color: #5a5550;
-            margin: 0 0 7px 0;
-            font-weight: 300;
-            line-height: 1.65;
+        .card-meta {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            margin: 0 0 12px 0;
         }
-        .card-desc {
+        .card-price {
             font-family: 'Inter', sans-serif;
-            font-size: 0.81rem;
+            font-size: 0.9rem;
+            font-weight: 400;
+            color: #1a1a1a;
+        }
+        .card-stars {
+            color: #C8A96E;
+            font-size: 0.85rem;
+            letter-spacing: 0.05em;
+        }
+        .card-reviews {
+            font-family: 'Inter', sans-serif;
+            font-size: 0.75rem;
             color: #9a9490;
-            margin: 0;
-            line-height: 1.65;
             font-weight: 300;
         }
+        .card-highlights {
+            font-family: 'Inter', sans-serif;
+            font-size: 0.82rem;
+            color: #5a5550;
+            margin: 0 0 14px 0;
+            font-weight: 300;
+            line-height: 1.65;
+        }
+        .card-community {
+            font-family: 'Cormorant Garamond', Georgia, serif;
+            font-size: 0.95rem;
+            font-style: italic;
+            font-weight: 300;
+            color: #7a7470;
+            margin: 14px 0 14px 0;
+            line-height: 1.6;
+            border-top: 1px solid #F0EDE8;
+            padding-top: 12px;
+        }
+        .shop-btn {
+            display: inline-block;
+            background: #1a1a1a;
+            color: #ffffff !important;
+            text-decoration: none !important;
+            font-family: 'Inter', sans-serif;
+            font-size: 0.72rem;
+            font-weight: 400;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            padding: 11px 20px;
+            border-radius: 4px;
+            transition: background 0.2s;
+        }
+        .shop-btn:hover { background: #2e2e2e; }
 
         /* ── Results page header ── */
         .profile-eyebrow {
@@ -601,25 +898,128 @@ def inject_css():
             line-height: 2.1;
             margin-bottom: 3rem;
         }
+
+        /* ── Demographics chip grid ── */
+        .chip-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin: 1.5rem 0 2.5rem 0;
+        }
+        .chip {
+            font-family: 'Inter', sans-serif;
+            font-size: 0.82rem;
+            font-weight: 300;
+            color: #5a5550;
+            background: transparent;
+            border: 1px solid #C8C2BB;
+            border-radius: 100px;
+            padding: 9px 20px;
+            cursor: pointer;
+            transition: all 0.15s;
+            letter-spacing: 0.02em;
+        }
+        .chip:hover { border-color: #8a8480; color: #1a1a1a; }
+        .chip.selected {
+            background: #1a1a1a;
+            border-color: #1a1a1a;
+            color: #ffffff;
+        }
+        .demo-section-label {
+            font-family: 'Inter', sans-serif;
+            font-size: 0.7rem;
+            font-weight: 400;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            color: #9a9490;
+            margin: 2rem 0 0.5rem 0;
+            display: block;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-def render_result_card(row: pd.Series, rank: int):
-    """Render one fragrance result as a minimal editorial row."""
+def _render_stars(rating_str: str) -> str:
+    try:
+        r = float(rating_str)
+        if r <= 0:
+            return ""
+    except (ValueError, TypeError):
+        return ""
+    stars = ""
+    for i in range(5):
+        stars += "★" if r >= i + 0.75 else ("½" if r >= i + 0.25 else "☆")
+    return stars
+
+
+def _format_reviews(reviews_str: str) -> str:
+    try:
+        n = int(float(reviews_str))
+        return f"{n/1000:.1f}k reviews" if n >= 1000 else f"{n} reviews"
+    except (ValueError, TypeError):
+        return ""
+
+
+def _format_price(price_str: str) -> str:
+    try:
+        return f"${float(price_str):.2f}"
+    except (ValueError, TypeError):
+        return price_str
+
+
+def render_result_card(row: pd.Series, rank: int, summary: str = ""):
+    """Render one Fragrantica product as a white card with rating, notes, and accords."""
+    import html as _html
     score_pct = int(row["similarity"] * 100)
+
+    stars   = _render_stars(row.get("rating", ""))
+    reviews = _format_reviews(row.get("reviews", ""))
+
+    meta_html = ""
+    if stars:
+        meta_html = (
+            f'<div class="card-meta">'
+            f'<span class="card-stars">{stars}</span>'
+            f'<span class="card-reviews">{reviews}</span>'
+            f'</div>'
+        )
+
+    notes = _html.escape((row.get("notes", "") or "").strip())
+    notes_html = f'<p class="card-highlights">{notes}</p>' if notes else ""
+
+    accords = _html.escape((row.get("accords", "") or "").strip())
+    accords_html = (
+        f'<p class="card-highlights" style="color:#9a9490;font-size:0.78rem;">{accords}</p>'
+        if accords else ""
+    )
+
+    safe_summary = _html.escape(summary) if summary else ""
+    community_html = f'<p class="card-community">{safe_summary}</p>' if safe_summary else ""
+
+    url = (row.get("url", "") or "").strip()
+    link_html = (
+        f'<a class="shop-btn" href="{_html.escape(url)}" target="_blank" rel="noopener">View on Fragrantica →</a>'
+        if url else ""
+    )
+
+    name  = _html.escape(str(row["name"]))
+    brand = _html.escape(str(row["brand"]))
+
     st.markdown(
         f"""
         <div class="result-card">
             <div class="card-top">
-                <p class="card-name">{row['name']}</p>
+                <p class="card-name">{name}</p>
                 <span class="card-rank">{score_pct}% match</span>
             </div>
-            <p class="card-brand">{row['brand']}</p>
-            <p class="card-notes">{row['notes']}</p>
-            <p class="card-desc">{row['description']}</p>
+            <p class="card-brand">{brand}</p>
+            {meta_html}
+            {notes_html}
+            {accords_html}
+            {community_html}
+            {link_html}
         </div>
         """,
         unsafe_allow_html=True,
@@ -693,6 +1093,32 @@ def show_question(step: int):
         )
         answered = bool(val.strip())
 
+        # Enable Continue button as soon as user types — no Enter required
+        import streamlit.components.v1 as components
+        components.html(
+            """
+            <script>
+            (function() {
+                function wire(attempts) {
+                    if (attempts <= 0) return;
+                    var doc = window.parent.document;
+                    var inp = doc.querySelector('[data-testid="stTextInput"] input');
+                    var btn = Array.from(doc.querySelectorAll('button[kind="primary"]'))
+                                  .find(function(b) {
+                                      return /Continue|See my matches/.test(b.textContent);
+                                  });
+                    if (!inp || !btn) { setTimeout(function(){ wire(attempts-1); }, 100); return; }
+                    inp.addEventListener('input', function() {
+                        btn.disabled = inp.value.trim().length === 0;
+                    });
+                }
+                wire(30);
+            })();
+            </script>
+            """,
+            height=0,
+        )
+
     else:  # multiple choice
         choice = st.radio(
             "pick one",
@@ -724,16 +1150,59 @@ def show_question(step: int):
             st.rerun()
 
 
+def show_demographics():
+    """Step 10: two quick chip questions before results."""
+    st.progress(1.0)
+    st.markdown('<span class="step-label">Almost there</span>', unsafe_allow_html=True)
+    st.markdown('<p class="quiz-question">One last thing — help us personalise your results.</p>', unsafe_allow_html=True)
+
+    age_options    = ["18-24", "25-34", "35-44", "45+"]
+    gender_options = ["Men's", "Women's", "Show me everything"]
+
+    age    = st.session_state.get("demo_age", None)
+    gender = st.session_state.get("demo_gender", None)
+
+    # Age chips
+    st.markdown('<span class="demo-section-label">How old are you?</span>', unsafe_allow_html=True)
+    age_cols = st.columns(len(age_options))
+    for i, opt in enumerate(age_options):
+        selected = age == opt
+        label = f"**{opt}**" if selected else opt
+        if age_cols[i].button(opt, key=f"age_{opt}", type="primary" if selected else "secondary", use_container_width=True):
+            st.session_state.demo_age = opt
+            st.rerun()
+
+    # Gender chips
+    st.markdown('<span class="demo-section-label">Which fragrances should we focus on?</span>', unsafe_allow_html=True)
+    gender_cols = st.columns(len(gender_options))
+    for i, opt in enumerate(gender_options):
+        selected = gender == opt
+        if gender_cols[i].button(opt, key=f"gender_{opt}", type="primary" if selected else "secondary", use_container_width=True):
+            st.session_state.demo_gender = opt
+            st.rerun()
+
+    st.markdown("<div style='height:2rem'></div>", unsafe_allow_html=True)
+
+    ready = age is not None and gender is not None
+    if st.button("See my matches", disabled=not ready, type="primary", use_container_width=True):
+        st.session_state.step = 11
+        st.rerun()
+
+
 def show_results(df: pd.DataFrame, embeddings: np.ndarray):
     """Results page: profile name, Q9 quote, recommendation cards, start-over."""
     answers = st.session_state.answers
 
+    age    = st.session_state.get("demo_age", "25-34")
+    gender = st.session_state.get("demo_gender", "Show me everything")
+
     # Compile query and run recommendation (cached in session_state)
-    query = compile_query(answers)
-    if st.session_state.get("results_query") != query:
+    query    = compile_query(answers, age=age)
+    cache_key = f"{query}|{gender}"
+    if st.session_state.get("results_query") != cache_key:
         with st.spinner("Finding your matches…"):
-            st.session_state.results_df    = recommend(query, df, embeddings, top_k=TOP_K)
-            st.session_state.results_query = query
+            st.session_state.results_df    = recommend(query, df, embeddings, gender=gender, top_k=TOP_K)
+            st.session_state.results_query = cache_key
 
     results = st.session_state.results_df
     profile = derive_scent_profile(answers)
@@ -753,13 +1222,17 @@ def show_results(df: pd.DataFrame, embeddings: np.ndarray):
         )
 
     st.markdown(
-        f'<span class="results-eyebrow">Your matches</span>',
+        '<span class="results-eyebrow">Your matches</span>',
         unsafe_allow_html=True,
     )
 
+    # ── Fetch community summaries (parallel, cached in session_state) ──
+    with st.spinner("Gathering community insights…"):
+        summaries = fetch_all_summaries(results)
+
     # ── Result cards ──
     for rank, (_, row) in enumerate(results.iterrows(), start=1):
-        render_result_card(row, rank)
+        render_result_card(row, rank, summaries.get(row["name"], ""))
 
     st.markdown("<div style='height:2.5rem'></div>", unsafe_allow_html=True)
 
@@ -779,11 +1252,16 @@ def main():
         layout="centered",
     )
     inject_css()
+    st.markdown("""
+<script>
+document.querySelectorAll('input, textarea').forEach(el => {
+    el.setAttribute('autocomplete', 'off');
+});
+</script>
+""", unsafe_allow_html=True)
 
-    # Load data and pre-compute embeddings once (cached globally by Streamlit)
-    df         = load_data()
-    corpus     = build_corpus(df)
-    embeddings = compute_embeddings(tuple(corpus))
+    # Load data + embeddings (from cache file if available, else compute once)
+    df, embeddings = load_data_and_embeddings()
 
     # Initialise quiz state on first load
     if "step" not in st.session_state:
@@ -796,6 +1274,8 @@ def main():
         show_intro()
     elif 1 <= step <= 9:
         show_question(step)
+    elif step == 10:
+        show_demographics()
     else:
         show_results(df, embeddings)
 
