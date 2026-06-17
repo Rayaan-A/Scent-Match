@@ -8,3 +8,6 @@ venv/
 *.egg-info/
 dist/
 .streamlit/secrets.toml
+*.npy
+*.pkl
+data/fra_cleaned.csv

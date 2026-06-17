@@ -1,25 +1,41 @@
-# 🌸 ScentMatch
+# ScentMatch
 
-AI-powered fragrance recommender. Describe a vibe — "fresh citrusy summer", "dark mysterious oud", "cozy vanilla winter" — and ScentMatch finds the best-matching perfumes using semantic embeddings.
+AI-powered fragrance recommender. Answer nine questions about who you are — your aesthetic, your environment, how you want people to feel around you — and ScentMatch finds real Sephora fragrances that match your personality using semantic AI embeddings.
 
 ## How it works
 
-1. Each fragrance's notes, accords, and description are embedded into a vector using `sentence-transformers` (`all-MiniLM-L6-v2`).
-2. Your query is embedded the same way.
-3. Cosine similarity ranks the fragrances closest to your query.
-4. The top results are displayed with name, brand, notes, and a match score.
+1. Each Sephora fragrance's name, brand, highlights, and ingredients are embedded into a vector using `sentence-transformers` (`all-MiniLM-L6-v2`).
+2. Your quiz answers are compiled into a natural-language description and embedded the same way.
+3. Cosine similarity ranks the fragrances closest to your personality.
+4. Results are shown as product cards with price, rating, and a direct link to buy on Sephora.
 
 ## Setup
 
-### 1. Install dependencies
+### 1. Download the Sephora dataset from Kaggle
+
+1. Go to: https://www.kaggle.com/datasets/nadyinky/sephora-products-and-skincare-reviews
+2. Download the dataset and extract `product_info.csv`
+3. Place it at `data/product_info.csv` (next to `app.py`)
+
+### 2. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-> **Note:** First run will download the ~80 MB `all-MiniLM-L6-v2` model automatically.
+### 3. Pre-compute embeddings (run once)
 
-### 2. Run the app
+```bash
+python precompute_embeddings.py
+```
+
+This filters the Sephora dataset to fragrance products, embeds all descriptions, and saves:
+- `embeddings_cache.npy` — the embedding matrix
+- `data/fra_processed.pkl` — the cleaned DataFrame
+
+Takes ~60–120 seconds the first time. Subsequent app starts load in under 2 seconds.
+
+### 4. Run the app
 
 ```bash
 streamlit run app.py
@@ -27,34 +43,23 @@ streamlit run app.py
 
 The app opens at `http://localhost:8501`.
 
-## Dataset
-
-The bundled `data/fragrances.csv` contains 50 hand-curated real fragrances and works out of the box.
-
-### Using the full Kaggle dataset (optional)
-
-1. Search Kaggle for **"fragrantica fragrance dataset"**
-2. Download the CSV (look for columns: name, brand, notes, accords, description)
-3. Rename/place it as `data/fra_cleaned.csv` next to `app.py`
-
-ScentMatch auto-detects the larger dataset on startup.
-
 ## Project structure
 
 ```
 scentmatch/
-├── app.py              # Streamlit UI + embedding + recommendation logic
+├── app.py                    # Streamlit UI + embedding + recommendation logic
+├── precompute_embeddings.py  # One-time script to build the embedding cache
 ├── data/
-│   └── fragrances.csv  # Bundled 50-fragrance sample dataset
+│   └── product_info.csv      # Sephora dataset (you download this)
 ├── requirements.txt
 └── README.md
 ```
 
-## Example queries
+## Optional: Community insights via Claude
 
-- `fresh citrusy summer scent for the beach`
-- `warm cozy vanilla for winter evenings`
-- `dark mysterious oud and leather`
-- `light floral rose for a wedding`
-- `clean soapy skin scent for everyday wear`
-- `sporty aquatic ocean breeze`
+If you set an `ANTHROPIC_API_KEY` environment variable, each result card will include a short community insight pulled from Reddit's r/fragrance community and summarised by Claude Haiku.
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+streamlit run app.py
+```

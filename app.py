@@ -1,340 +1,63 @@
 """
 ScentMatch — personality quiz → fragrance recommender.
 
-Backend: sentence-transformers embeddings + cosine similarity.
-Frontend: 9-question personality quiz that compiles answers into a semantic
-          search query passed to the embedding backend.
-Dataset: Fragrantica dataset (fra_cleaned.csv).
+Quiz flow:
+  step 0  : intro
+  step 1  : Phase 0 — occasion multi-select
+  steps 2-12 : Phase 1 — 11 personality questions
+  step 13 : demographics (age / budget / gender)
+  step 14 : results (Gemini recommendations)
 """
 
-import ast
-import re
-import pandas as pd
-import numpy as np
-import streamlit as st
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
+import html as _html
+import json
 import os
-import requests
-import anthropic
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
 
-# ─────────────────────────────────────────────
-# Configuration
-# ─────────────────────────────────────────────
+import streamlit as st
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 
-FRA_PATH        = os.path.join(os.path.dirname(__file__), "data", "fra_cleaned.csv")
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-TOP_K           = 5
+load_dotenv()
 
-
-# ─────────────────────────────────────────────
-# Backend
-# ─────────────────────────────────────────────
-
-def _parse_list_col(val) -> str:
-    """Convert a stringified Python list like \"['a', 'b']\" to comma-joined text."""
-    if not val or (isinstance(val, float)):
-        return ""
-    s = str(val).strip()
-    try:
-        parsed = ast.literal_eval(s)
-        if isinstance(parsed, list):
-            return ", ".join(str(x) for x in parsed)
-    except Exception:
-        pass
-    return re.sub(r"[\[\]'\"]", "", s).strip()
-
-
-def load_data() -> pd.DataFrame:
-    """Load and normalise the Fragrantica dataset."""
-    if not os.path.exists(FRA_PATH):
-        raise FileNotFoundError(
-            f"Fragrantica dataset not found at {FRA_PATH}.\n"
-            "Run: python precompute_embeddings.py"
-        )
-
-    df = pd.read_csv(FRA_PATH, encoding="latin-1", on_bad_lines="skip", sep=None, engine="python")
-    df.columns = df.columns.str.strip()
-
-    rename_map = {
-        "Perfume":      "name",
-        "Brand":        "brand",
-        "Gender":       "gender",
-        "Rating Value": "rating",
-        "Rating Count": "reviews",
-    }
-    df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns}, inplace=True)
-
-    # Ratings use European comma-decimal format ("3,42" → "3.42")
-    if "rating" in df.columns:
-        df["rating"] = df["rating"].astype(str).str.replace(",", ".", regex=False).str.strip()
-
-    # Combine Top/Middle/Base into a labelled notes string
-    note_cols = [c for c in ["Top", "Middle", "Base"] if c in df.columns]
-    df["notes"] = df[note_cols].fillna("").apply(
-        lambda row: "  ·  ".join(
-            f"{col}: {val.strip()}" for col, val in zip(note_cols, row) if str(val).strip()
-        ),
-        axis=1,
-    )
-
-    # Combine mainaccord columns into a comma-separated string
-    accord_cols = [c for c in df.columns if c.startswith("mainaccord")]
-    df["accords"] = df[accord_cols].fillna("").apply(
-        lambda row: ", ".join(str(v).strip() for v in row if str(v).strip()),
-        axis=1,
-    )
-
-    # Gender already lowercase in Fragrantica: "women" / "men" / "unisex"
-    if "gender" in df.columns:
-        df["gender"] = df["gender"].str.lower().str.strip().fillna("unisex")
-    else:
-        df["gender"] = "unisex"
-
-    for col in ["name", "brand", "rating", "reviews", "notes", "accords", "url"]:
-        if col not in df.columns:
-            df[col] = ""
-        df[col] = df[col].fillna("").astype(str).str.strip()
-
-    df = df[df["name"] != ""].reset_index(drop=True)
-    print(f"[load_data] Fragrantica products loaded: {len(df):,}")
-    return df
-
-
-def build_corpus(df: pd.DataFrame) -> list[str]:
-    """Build embeddable text from name, brand, all note columns, accords, and country."""
-    corpus = []
-    note_cols = [c for c in ["Top", "Middle", "Base"] if c in df.columns]
-    for _, row in df.iterrows():
-        parts = [row["name"], row["brand"]]
-        # Labeled notes string ("Top: X · Middle: Y · Base: Z")
-        if row.get("notes"):
-            parts.append(row["notes"])
-        # Raw parsed notes — repeat ingredient names for denser keyword signal
-        for col in note_cols:
-            raw = _parse_list_col(row.get(col, ""))
-            if raw:
-                parts.append(raw)
-        if row.get("accords"):
-            parts.append(row["accords"])
-        country = str(row.get("Country", "") or "").strip()
-        if country:
-            parts.append(country)
-        corpus.append(" ".join(p for p in parts if p))
-    return corpus
-
-
-CACHE_PATH = os.path.join(os.path.dirname(__file__), "embeddings_cache.npy")
-PKL_PATH   = os.path.join(os.path.dirname(__file__), "data", "fra_processed.pkl")
-
-
-@st.cache_resource(show_spinner="Loading model…")
-def load_model() -> SentenceTransformer:
-    return SentenceTransformer(EMBEDDING_MODEL)
-
-
-@st.cache_resource(show_spinner="Loading fragrances…")
-def load_data_and_embeddings():
-    """
-    Load DataFrame + embeddings from pre-computed cache if available,
-    otherwise compute on the fly and save for next time.
-    """
-    if os.path.exists(PKL_PATH) and os.path.exists(CACHE_PATH):
-        df         = pd.read_pickle(PKL_PATH)
-        embeddings = np.load(CACHE_PATH)
-        return df, embeddings
-
-    # First-run fallback: compute and save
-    df         = load_data()
-    corpus     = build_corpus(df)
-    model      = load_model()
-    embeddings = model.encode(corpus, convert_to_numpy=True, show_progress_bar=False)
-    np.save(CACHE_PATH, embeddings)
-    df.to_pickle(PKL_PATH)
-    return df, embeddings
-
-
-def recommend(
-    query: str,
-    df: pd.DataFrame,
-    embeddings: np.ndarray,
-    gender: str = "Show me everything",
-    top_k: int = 5,
-):
-    full_query = query
-
-    # ── Gender hard-filter ──
-    if gender != "Show me everything" and "gender" in df.columns:
-        allowed = {"men"} if gender == "Men's" else {"women"}
-        # include unisex always
-        mask = df["gender"].isin(allowed | {"unisex"})
-        filt_df  = df[mask].reset_index(drop=True)
-        filt_emb = embeddings[mask.values]
-    else:
-        filt_df  = df
-        filt_emb = embeddings
-
-    # ── Men's: exclude feminine-skewing unisex products and boost genuine men's ──
-    if gender == "Men's":
-        _MENS_EXCLUSIONS = [
-            "jo malone", "kayali", "blossom", "honey", "juicy", "rose",
-            "floral", "peony", "cherry", "lace", "bridal", "nude",
-        ]
-        combined = (filt_df["name"] + " " + filt_df["brand"]).str.lower()
-        exclude_mask = combined.apply(
-            lambda s: any(term in s for term in _MENS_EXCLUSIONS)
-        ) & (filt_df["gender"] == "unisex")
-        filt_emb = filt_emb[~exclude_mask.values]
-        filt_df  = filt_df[~exclude_mask].reset_index(drop=True)
-
-    model     = load_model()
-    query_vec = model.encode([full_query], convert_to_numpy=True)
-    scores    = cosine_similarity(query_vec, filt_emb)[0]
-
-    # ── Men's: boost genuine men's products so they rank above unisex ──
-    if gender == "Men's" and "gender" in filt_df.columns:
-        scores = scores.copy()
-        scores[filt_df["gender"].values == "men"] += 0.05
-
-    # ── Debug: print query + top-10 scores to terminal ──
-    print(f"\n[DEBUG] Query ({len(full_query)} chars):\n  {full_query[:300]}")
-    print(f"[DEBUG] Gender filter: {gender}  |  Pool size: {len(filt_df)}")
-    print("[DEBUG] Top 10 scores:")
-    top10 = np.argsort(scores)[::-1][:10]
-    for rank, idx in enumerate(top10, 1):
-        print(f"  {rank:2d}. {filt_df.iloc[idx]['name'][:40]:40s}  {filt_df.iloc[idx]['brand'][:20]:20s}  {scores[idx]:.4f}")
-    print(f"[DEBUG] Score range (top-10): {scores[top10[-1]]:.4f} – {scores[top10[0]]:.4f}\n")
-
-    # ── Diversity: pool top-20, deduplicate by brand, take top_k ──
-    pool_size = min(top_k * 4, len(filt_df))
-    pool_idx  = np.argsort(scores)[::-1][:pool_size]
-    pool_df   = filt_df.iloc[pool_idx].copy()
-    pool_df["similarity"] = scores[pool_idx]
-
-    seen_brands: set[str] = set()
-    deduped: list[pd.Series] = []
-    for _, row in pool_df.iterrows():
-        brand = row["brand"].lower().strip()
-        if brand not in seen_brands:
-            seen_brands.add(brand)
-            deduped.append(row)
-        if len(deduped) >= top_k:
-            break
-
-    results = pd.DataFrame(deduped).reset_index(drop=True)
-    return results
-
-
-# ─────────────────────────────────────────────
-# Community insight layer (Reddit → Claude)
-# ─────────────────────────────────────────────
-
-def _fetch_reddit_texts(fragrance_name: str, brand: str) -> list[str]:
-    """Search r/fragrance for posts about this fragrance and return raw text snippets."""
-    query = f"{fragrance_name} {brand}"
-    params = {"q": query, "limit": 8, "sort": "top", "t": "all", "restrict_sr": 1}
-    headers = {"User-Agent": "ScentMatch/1.0 (fragrance recommendation app)"}
-    try:
-        r = requests.get(
-            "https://www.reddit.com/r/fragrance/search.json",
-            params=params, headers=headers, timeout=5,
-        )
-        r.raise_for_status()
-        texts = []
-        for post in r.json()["data"]["children"]:
-            d = post["data"]
-            if d.get("title"):
-                texts.append(d["title"])
-            body = d.get("selftext", "").strip()
-            if body and len(body) > 40:
-                texts.append(body[:500])
-        return texts
-    except Exception:
-        return []
-
-
-def _summarize_with_claude(fragrance_name: str, texts: list[str]) -> str:
-    """
-    Turn raw community text into one or two natural sentences using Claude Haiku.
-    Haiku is intentionally chosen here — this runs once per result card per search,
-    so cost matters. Falls back silently if ANTHROPIC_API_KEY is not set.
-    """
-    if not texts:
-        return ""
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        return ""
-    try:
-        client = anthropic.Anthropic(api_key=api_key)
-        combined = "\n".join(texts[:6])
-        response = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=120,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Based on these fragrance enthusiast discussions about {fragrance_name}, "
-                    "write 1-2 natural sentences describing how wearers experience it and what makes it "
-                    "distinctive. Third person, present tense. No attribution, no quotes, no 'people say' "
-                    "— just flowing descriptive prose.\n\n"
-                    f"Discussions:\n{combined}"
-                ),
-            }],
-        )
-        return response.content[0].text.strip()
-    except Exception:
-        return ""
-
-
-def fetch_all_summaries(results_df: pd.DataFrame) -> dict[str, str]:
-    """
-    Fetch Reddit data and generate Claude summaries for all result fragrances in parallel.
-    Results are stored in st.session_state to avoid re-fetching on Streamlit reruns.
-    """
-    cache = st.session_state.setdefault("summary_cache", {})
-
-    def fetch_one(name: str, brand: str) -> tuple[str, str]:
-        key = f"{name}::{brand}"
-        if key in cache:
-            return name, cache[key]
-        texts  = _fetch_reddit_texts(name, brand)
-        summary = _summarize_with_claude(name, texts)
-        cache[key] = summary
-        return name, summary
-
-    summaries: dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = {
-            pool.submit(fetch_one, row["name"], row["brand"]): row["name"]
-            for _, row in results_df.iterrows()
-        }
-        for future in as_completed(futures):
-            name, summary = future.result()
-            summaries[name] = summary
-
-    return summaries
-
+TOTAL_STEPS = 13  # steps 1-13 are quiz/demo; used for progress bar
 
 # ─────────────────────────────────────────────
 # Quiz definitions
 # ─────────────────────────────────────────────
 
-QUESTIONS = [
-    {
-        "type": "text",
-        "label": "Describe a smell — not a fragrance, just a smell — that instantly makes you feel good.",
-        "placeholder": "e.g. petrichor after rain, old bookshops, sunscreen at the beach...",
-    },
+PHASE0_OCCASIONS = [
+    "Daily signature",
+    "Summer / hot weather",
+    "Night outs / dates / parties",
+    "Office / professional settings",
+    "Casual weekends",
+    "Cold weather / winter",
+    "Special occasions / formal events",
+    "A gift for someone else",
+]
+
+PHASE1_QUESTIONS = [
     {
         "type": "text",
         "label": "You walk into a party where you know maybe 2 people. What are you actually doing for the first 20 minutes?",
-        "placeholder": "e.g. find my people and stick close, grab a drink and observe, talk to strangers...",
+        "placeholder": "grab a drink and observe, find my people and stick close, talk to strangers...",
     },
     {
         "type": "text",
         "label": "Describe your aesthetic in 3 words. Not aspirational — what you actually wear on a regular Tuesday.",
-        "placeholder": "e.g. clean quiet minimal... cozy chaotic librarian... dark academia soft...",
+        "placeholder": "clean quiet minimal... cozy chaotic librarian... dark academia soft...",
+    },
+    {
+        "type": "text",
+        "label": "Free Saturday with zero obligations. Walk me through it.",
+        "placeholder": "sleep in, long coffee, walk... gym at 6am, brunch, errands... nothing before noon...",
+    },
+    {
+        "type": "text",
+        "label": "Describe a smell — not a fragrance, just a smell — that instantly makes you feel good.",
+        "placeholder": "petrichor after rain, old bookshops, sunscreen at the beach, fresh laundry...",
     },
     {
         "type": "choice",
@@ -348,26 +71,36 @@ QUESTIONS = [
         ],
     },
     {
-        "type": "choice",
-        "label": "Fresh & bright or warm & rich — which pulls you more?",
-        "options": [
-            "Fresh & bright (citrus, mint, cucumber)",
-            "Warm & rich (vanilla, spice, dark chocolate)",
-            "Somewhere in between",
-            "Depends on my mood",
-        ],
+        "type": "text",
+        "label": "How do you want people to feel when you enter a room? Not how you want to look — how you want them to feel.",
+        "placeholder": "comfortable, intrigued, like something shifted, calm, energised...",
     },
     {
         "type": "text",
-        "label": "How do you want people to feel when you enter a room? Not how you want to look — how you want them to feel.",
-        "placeholder": "e.g. comfortable, intrigued, like the energy shifted...",
+        "label": "Describe a color palette that matches your vibe. Pick 3 colors.",
+        "placeholder": "navy, cream, aged leather... terracotta, sand, olive... black, grey, white...",
+    },
+    {
+        "type": "multi",
+        "label": "Which scent directions pull you? Pick everything that applies.",
+        "options": [
+            "Fresh & aquatic (ocean, sea salt, clean water)",
+            "Fresh & citrus (lemon, bergamot, grapefruit)",
+            "Fresh & green (grass, herbs, cucumber)",
+            "Floral (rose, jasmine, peony, iris)",
+            "Warm & spicy (cardamom, pepper, ginger)",
+            "Warm & sweet (vanilla, caramel, tonka)",
+            "Woody & earthy (cedar, sandalwood, vetiver)",
+            "Smoky & dark (oud, leather, tobacco, incense)",
+            "Powdery & soft (musk, iris, violet)",
+        ],
     },
     {
         "type": "choice",
-        "label": "Do you want your fragrance to be noticed by others, or is it more something you wear for yourself?",
+        "label": "Is your fragrance more for others, or for yourself?",
         "options": [
-            "Mostly for others",
-            "Mostly for myself",
+            "Mostly for others — I want to leave an impression",
+            "Mostly for myself — it's personal",
             "Both equally",
         ],
     },
@@ -387,159 +120,178 @@ QUESTIONS = [
     },
 ]
 
-# ─────────────────────────────────────────────
-# Quiz logic helpers
-# ─────────────────────────────────────────────
-
-# Scent profile name derived from Q4 (environment) × Q5 (palate)
-_SCENT_PROFILES = {
-    ("forest",   "fresh"):  "The Forest Bather",
-    ("forest",   "warm"):   "The Dark Wanderer",
-    ("forest",   "other"):  "The Woodland Drifter",
-    ("ocean",    "fresh"):  "The Sea Drifter",
-    ("ocean",    "warm"):   "The Ocean Alchemist",
-    ("ocean",    "other"):  "The Coastal Soul",
-    ("urban",    "fresh"):  "The City Minimalist",
-    ("urban",    "warm"):   "The Night Architect",
-    ("urban",    "other"):  "The Urban Mystic",
-    ("desert",   "fresh"):  "The Sunrise Nomad",
-    ("desert",   "warm"):   "The Desert Mystic",
-    ("desert",   "other"):  "The Sand Wanderer",
-    ("garden",   "fresh"):  "The Petrichor Soul",
-    ("garden",   "warm"):   "The Garden Romantic",
-    ("garden",   "other"):  "The Bloom Chaser",
-}
-
-
-def _env_key(answer: str) -> str:
-    a = (answer or "").lower()
-    if "forest" in a:               return "forest"
-    if "ocean" in a:                return "ocean"
-    if "urban" in a or "roof" in a: return "urban"
-    if "desert" in a:               return "desert"
-    if "garden" in a or "rain" in a:return "garden"
-    return ""
-
-
-def _palate_key(answer: str) -> str:
-    a = (answer or "").lower()
-    if "fresh" in a or "bright" in a: return "fresh"
-    if "warm" in a or "rich" in a:    return "warm"
-    return "other"
-
-
-def derive_scent_profile(answers: list) -> str:
-    env     = _env_key(answers[3] or "")
-    palate  = _palate_key(answers[4] or "")
-    return _SCENT_PROFILES.get((env, palate), "The Scent Seeker")
-
-
-_ENVIRONMENT_MAP = {
-    "Dense forest":          "woody mossy earthy vetiver oakmoss green dark",
-    "Open ocean":            "aquatic marine fresh ozonic citrus light clean",
-    "Urban rooftop at night":"smoky amber leather dark woody musk urban",
-    "Desert at sunrise":     "dry warm spicy resinous amber incense arid",
-    "Garden after rain":     "floral green fresh petrichor soft dewy rose",
-}
-
-_PALATE_MAP = {
-    "Fresh & bright":      "citrus bergamot mint grapefruit light fresh clean",
-    "Warm & rich":         "vanilla amber sandalwood spice dark chocolate gourmand",
-    "Somewhere in between":"woody musk balanced moderate clean warm",
-    "Depends on my mood":  "versatile fresh woody",
-}
-
-_MOOD_KEYWORD_MAP = [
-    (["comfort", "cozy", "warm"],           "vanilla musk amber soft"),
-    (["confident", "bold", "strong"],        "oud leather woody spicy intense"),
-    (["fresh", "clean", "light"],            "citrus aquatic bergamot clean"),
-    (["mysterious", "dark", "deep"],         "oud smoky resinous dark amber"),
-    (["natural", "earthy", "outdoors"],      "vetiver moss green woody earth"),
-    (["sweet", "dessert", "food"],           "vanilla gourmand caramel praline"),
-    (["floral", "flowers", "garden"],        "rose jasmine peony iris floral"),
-    (["ocean", "beach", "sea", "water"],     "marine aquatic salt fresh"),
-    (["rain"],                               "petrichor green fresh ozonic"),
-    (["coffee", "cafe", "bookshop"],         "warm woody tobacco vanilla"),
-    (["wood", "forest", "trees"],            "cedar sandalwood vetiver pine"),
-    (["citrus", "fruit", "lemon", "orange"], "bergamot citrus grapefruit"),
+_Q_LABELS = [
+    "Party behavior (first 20 min)",
+    "Aesthetic in 3 words",
+    "Free Saturday walkthrough",
+    "Smell that makes them feel good",
+    "Environment that fits them",
+    "How they want people to feel when they enter",
+    "Color palette (3 colors)",
+    "Scent direction preference",
+    "Fragrance for others or themselves",
+    "One signature or rotating",
+    "I want to smell like someone who...",
 ]
 
-_AGE_MAP = {
-    "18-24": "fresh light citrus clean modern",
-    "25-34": "",
-    "35-44": "complex woody amber sophisticated",
-    "45+":   "rich classic oriental deep sillage",
+
+# ─────────────────────────────────────────────
+# Gemini
+# ─────────────────────────────────────────────
+
+_SYSTEM_PROMPT = """You are an expert fragrance analyst. A user has completed a quiz on a website and their answers will be passed to you as structured data. Your job is to analyze their answers and return personalized fragrance recommendations immediately — no questions, no back and forth, just your analysis and output.
+
+---
+
+## INPUT FORMAT
+
+You will receive the user's quiz answers in this format:
+
+OCCASION: [what they are shopping for — daily, summer, night out, office, gift, etc.]
+AGE: [their age]
+BUDGET: [per bottle in USD]
+SOCIAL STYLE: [their answer to the party/social question]
+AESTHETIC: [3 words describing their style]
+FREE DAY: [how they'd spend a free Saturday]
+SMELL THEY LOVE: [non-fragrance smell they enjoy]
+ENVIRONMENT: [forest, ocean, rooftop, desert, or garden]
+ROOM PRESENCE: [how they want people to feel when they enter]
+COLOR PALETTE: [their vibe in colors]
+FLAVOR PALATE: [fresh/bright or warm/rich]
+NOTICEABILITY: [for self or for others]
+ROTATION: [one signature or multiple]
+IDENTITY STATEMENT: [their "I want to smell like someone who..." answer]
+
+---
+
+## YOUR TASK
+
+Step 1 — BUILD AN INTERNAL PROFILE
+Before recommending anything, silently analyze:
+- Personality type (introverted/extroverted, bold/understated, energetic/calm)
+- What scent families suit them (citrus, aquatic, woody, oriental, green, gourmand, floral, fruity)
+- What constraints apply (age maturity, budget, occasion)
+- What they actually need vs what they think they want
+
+Step 2 — APPLY THESE HARD RULES before recommending anything:
+
+AGE RULE: If the user is under 24, do not recommend fragrances that skew 30+
+
+BUDGET RULE: Never recommend a fragrance above their stated budget. If a slightly over-budget option is worth flagging, mention it once as an "if you can stretch" aside — never as a primary recommendation.
+
+OCCASION RULE: Every recommendation must be appropriate for the stated occasion. Do not recommend a heavy night-out fragrance for daily summer wear, or a thin aquatic for a cold-weather formal occasion.
+
+Step 3 — RECOMMEND 3 TO 5 FRAGRANCES
+
+Always include at minimum:
+- One SAFE pick — accessible, crowd-pleasing, low risk
+- One UNIQUE pick — underrated, less talked about, more character
+- One SIGNATURE pick — the deepest match to who they are
+
+If they selected multiple occasions, label each pick with its best occasion.
+
+---
+
+## OUTPUT FORMAT
+
+Return a single JSON object with exactly two keys — no markdown, no backticks, nothing else:
+
+{
+  "profile_summary": "1-2 sentences. Sharp and specific. Who is this person and what do they need from a fragrance. Reference their actual answers. Second person.",
+  "fragrances": [
+    {
+      "name": "fragrance name",
+      "brand": "house name",
+      "family": "fragrance family (e.g. woody aromatic, fresh citrus)",
+      "top_notes": "top notes",
+      "middle_notes": "middle / heart notes",
+      "base_notes": "base notes",
+      "why": "2-3 sentences tied directly to something they said",
+      "price": "price range with $ sign (e.g. '$85' or '$60–$120')",
+      "pick_type": "Safe Pick | Unique Pick | Signature Pick",
+      "heat_performance": "one sentence on how it performs in heat",
+      "caveat": "one honest caveat"
+    }
+  ]
 }
 
-_AUDIENCE_MAP = {
-    "Mostly for others": "sillage projection bold lasting",
-    "Mostly for myself": "skin scent subtle personal intimate",
-    "Both equally":      "moderate balanced",
-}
+## TONE RULES
+
+- Be direct. No fluff, no filler, no generic statements
+- Every sentence must be traceable to something the user actually said
+- Do not use fragrance clichés like "versatile for any occasion" or "perfect for day to night"
+- Write like a knowledgeable friend who happens to know everything about fragrance — not like a perfume counter salesperson"""
 
 
-def build_fragrance_query(answers: list, age: str = "") -> str:
-    """
-    Translate raw quiz answers into a fragrance-vocabulary-enriched query string.
-    Returns: "[original compiled answers]. Fragrance profile: [translated terms]"
-    """
-    a = [x or "" for x in answers]
-
-    # ENVIRONMENT (answers[3])
-    env_terms = _ENVIRONMENT_MAP.get(a[3], "")
-
-    # PALATE (answers[4]) — partial match because options carry extra parenthetical text
-    palate_terms = ""
-    for key, val in _PALATE_MAP.items():
-        if key.lower() in a[4].lower():
-            palate_terms = val
-            break
-
-    # MOOD/INTENTION — scan all open-text answers
-    text_blob = " ".join([a[0], a[1], a[2], a[5], a[8]]).lower()
-    mood_terms = [
-        terms for keywords, terms in _MOOD_KEYWORD_MAP
-        if any(kw in text_blob for kw in keywords)
-    ]
-
-    # AGE
-    age_terms = _AGE_MAP.get(age, "")
-
-    # AUDIENCE (answers[6])
-    audience_terms = _AUDIENCE_MAP.get(a[6], "")
-
-    translated = " ".join(
-        t for t in [env_terms, palate_terms, " ".join(mood_terms), age_terms, audience_terms]
-        if t
+def _build_prompt(occasions, answers, age, budget, gender):
+    a = [x or "(skipped)" for x in answers]
+    occasion_str = ", ".join(occasions) if occasions else "not specified"
+    return (
+        f"OCCASION: {occasion_str}\n"
+        f"AGE: {age}\n"
+        f"BUDGET: {budget} per bottle\n"
+        f"SOCIAL STYLE: {a[0]}\n"
+        f"AESTHETIC: {a[1]}\n"
+        f"FREE DAY: {a[2]}\n"
+        f"SMELL THEY LOVE: {a[3]}\n"
+        f"ENVIRONMENT: {a[4]}\n"
+        f"ROOM PRESENCE: {a[5]}\n"
+        f"COLOR PALETTE: {a[6]}\n"
+        f"FLAVOR PALATE: {a[7]}\n"
+        f"NOTICEABILITY: {a[8]}\n"
+        f"ROTATION: {a[9]}\n"
+        f"IDENTITY STATEMENT: {a[10]}\n"
+        f"GENDER PREFERENCE: {gender}"
     )
 
-    raw_answers = ". ".join(x for x in a if x.strip())
-    return f"{raw_answers}. Fragrance profile: {translated}".strip()
 
+def get_gemini_recommendations(occasions, answers, age, budget, gender):
+    api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY not configured")
 
-def compile_query(answers: list, age: str = "") -> str:
-    return build_fragrance_query(answers, age=age)
-
-
-def reset_quiz():
-    """Clear all quiz state so the app returns to the intro screen."""
-    st.session_state.step = 0
-    st.session_state.answers = [None] * 9
-    st.session_state.pop("demo_age", None)
-    st.session_state.pop("demo_gender", None)
-    st.session_state.pop("results_df", None)
-    st.session_state.pop("results_query", None)
-    for i in range(1, 10):
-        st.session_state.pop(f"q{i}_text", None)
-        st.session_state.pop(f"q{i}_choice", None)
+    prompt = _build_prompt(occasions, answers, age, budget, gender)
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model="gemini-flash-latest",
+        config=types.GenerateContentConfig(
+            system_instruction=_SYSTEM_PROMPT,
+            temperature=0.7,
+        ),
+        contents=prompt,
+    )
+    raw = response.text.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    parsed = json.loads(raw)
+    profile_summary = parsed.get("profile_summary", "")
+    fragrances = parsed.get("fragrances", [])
+    return profile_summary, fragrances
 
 
 # ─────────────────────────────────────────────
-# UI helpers
+# State helpers
+# ─────────────────────────────────────────────
+
+def reset_quiz():
+    for key in [
+        "step", "occasions", "answers",
+        "demo_age", "demo_budget", "demo_budget_range", "demo_gender",
+        "results_profile", "results_data", "results_key", "results_error",
+    ]:
+        st.session_state.pop(key, None)
+    # also clear per-question widget keys
+    for i in range(1, 14):
+        st.session_state.pop(f"q{i}_text", None)
+        st.session_state.pop(f"q{i}_choice", None)
+    st.session_state.pop("occ_radio", None)
+
+
+# ─────────────────────────────────────────────
+# CSS
 # ─────────────────────────────────────────────
 
 def inject_css():
-    """Inject custom CSS for the warm luxury minimal theme."""
     st.markdown(
         """
         <style>
@@ -548,7 +300,7 @@ def inject_css():
         /* ── Hide Streamlit chrome ── */
         #MainMenu, footer, header { visibility: hidden; }
 
-        /* ── Warm gradient background, fixed so it doesn't scroll ── */
+        /* ── Warm gradient background ── */
         html, body {
             background: linear-gradient(160deg, #F5F0EB 0%, #EDE8E2 100%) !important;
             background-attachment: fixed !important;
@@ -556,9 +308,7 @@ def inject_css():
         }
         [data-testid="stAppViewContainer"],
         [data-testid="stMain"],
-        section[data-testid="stSidebar"] {
-            background: transparent !important;
-        }
+        section[data-testid="stSidebar"] { background: transparent !important; }
         .stApp {
             background: linear-gradient(160deg, #F5F0EB 0%, #EDE8E2 100%) fixed !important;
         }
@@ -575,12 +325,10 @@ def inject_css():
         /* ── Full-width 2px progress line pinned to top ── */
         div[data-testid="stProgressBar"] {
             position: fixed;
-            top: 0;
-            left: 0;
+            top: 0; left: 0;
             width: 100vw;
             z-index: 9999;
-            padding: 0;
-            margin: 0;
+            padding: 0; margin: 0;
             background: transparent;
         }
         div[data-testid="stProgressBar"] > div {
@@ -595,7 +343,7 @@ def inject_css():
             transition: width 0.4s ease;
         }
 
-        /* ── Text input: warm inset field ── */
+        /* ── Text input ── */
         div[data-testid="stTextInput"] > div > div {
             background: #EFEBE6 !important;
             border: none !important;
@@ -622,11 +370,10 @@ def inject_css():
             color: #b5afa8 !important;
             font-weight: 300 !important;
         }
-        /* Hide "Press Enter to apply" hint */
         div[data-testid="stTextInput"] small,
         [data-testid="InputInstructions"] { display: none !important; }
 
-        /* ── Radio options: clean separator rows ── */
+        /* ── Radio options ── */
         div[data-testid="stRadio"] > div { gap: 0; }
         div[data-testid="stRadio"] label {
             padding: 15px 0;
@@ -640,7 +387,6 @@ def inject_css():
             font-weight: 300;
             color: #2a2520;
             cursor: pointer;
-            transition: color 0.15s;
             display: flex;
             align-items: center;
             gap: 12px;
@@ -650,7 +396,24 @@ def inject_css():
             border-top: 1px solid #DDD8D2 !important;
         }
 
-        /* ── PRIMARY button (Continue / Begin / See my matches) ── */
+        /* ── Checkboxes (Phase 0 occasions) — styled like radio rows ── */
+        div[data-testid="stCheckbox"] {
+            border-bottom: 1px solid #DDD8D2;
+            padding: 13px 0;
+        }
+        div[data-testid="stCheckbox"]:first-of-type {
+            border-top: 1px solid #DDD8D2;
+        }
+        div[data-testid="stCheckbox"] label {
+            font-size: 0.96rem !important;
+            font-family: 'Inter', sans-serif !important;
+            font-weight: 300 !important;
+            color: #2a2520 !important;
+            gap: 12px !important;
+        }
+        div[data-testid="stCheckbox"] label:hover { color: #1a1a1a !important; }
+
+        /* ── PRIMARY button ── */
         button[kind="primary"] {
             background: #1a1a1a !important;
             color: #ffffff !important;
@@ -665,17 +428,14 @@ def inject_css():
             transition: background 0.2s !important;
             box-shadow: none !important;
         }
-        button[kind="primary"]:hover {
-            background: #2e2e2e !important;
-            color: #ffffff !important;
-        }
+        button[kind="primary"]:hover { background: #2e2e2e !important; color: #ffffff !important; }
         button[kind="primary"]:disabled {
             background: #ccc8c3 !important;
             color: #f0ede9 !important;
             cursor: not-allowed !important;
         }
 
-        /* ── SECONDARY button (Skip) — plain text link, no box ── */
+        /* ── SECONDARY button (Skip / Start over) ── */
         button[kind="secondary"] {
             background: transparent !important;
             color: #9a9490 !important;
@@ -722,7 +482,7 @@ def inject_css():
             display: block;
         }
 
-        /* ── Result card — white card on cream background ── */
+        /* ── Result card ── */
         .result-card {
             background: #ffffff;
             border-radius: 12px;
@@ -730,7 +490,6 @@ def inject_css():
             margin-bottom: 16px;
             box-shadow: 0 1px 10px rgba(0,0,0,0.06), 0 0 1px rgba(0,0,0,0.04);
         }
-
         .card-top {
             display: flex;
             justify-content: space-between;
@@ -745,16 +504,18 @@ def inject_css():
             margin: 0;
             letter-spacing: 0.02em;
         }
-        .card-rank {
+        .card-pick-type {
             font-family: 'Inter', sans-serif;
-            font-size: 0.68rem;
+            font-size: 0.64rem;
             letter-spacing: 0.1em;
             color: #b5afa8;
-            font-weight: 300;
+            font-weight: 400;
             white-space: nowrap;
             margin-left: 16px;
             flex-shrink: 0;
+            text-transform: uppercase;
         }
+        .card-pick-type.signature { color: #8a7a6a; }
         .card-brand {
             font-family: 'Inter', sans-serif;
             font-size: 0.7rem;
@@ -764,65 +525,59 @@ def inject_css():
             text-transform: uppercase;
             font-weight: 400;
         }
-        .card-meta {
-            display: flex;
-            align-items: center;
-            gap: 16px;
+        .card-family {
+            font-family: 'Inter', sans-serif;
+            font-size: 0.72rem;
+            color: #b5afa8;
             margin: 0 0 12px 0;
-        }
-        .card-price {
-            font-family: 'Inter', sans-serif;
-            font-size: 0.9rem;
-            font-weight: 400;
-            color: #1a1a1a;
-        }
-        .card-stars {
-            color: #C8A96E;
-            font-size: 0.85rem;
-            letter-spacing: 0.05em;
-        }
-        .card-reviews {
-            font-family: 'Inter', sans-serif;
-            font-size: 0.75rem;
-            color: #9a9490;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
             font-weight: 300;
         }
-        .card-highlights {
+        .card-notes {
             font-family: 'Inter', sans-serif;
             font-size: 0.82rem;
             color: #5a5550;
-            margin: 0 0 14px 0;
+            margin: 0 0 10px 0;
             font-weight: 300;
             line-height: 1.65;
         }
-        .card-community {
+        .card-meta {
+            font-family: 'Inter', sans-serif;
+            font-size: 0.78rem;
+            color: #9a9490;
+            margin: 0 0 6px 0;
+            font-weight: 300;
+        }
+        .card-heat {
+            font-family: 'Inter', sans-serif;
+            font-size: 0.78rem;
+            color: #9a9490;
+            margin: 0 0 12px 0;
+            font-weight: 300;
+            font-style: italic;
+        }
+        .card-why {
             font-family: 'Cormorant Garamond', Georgia, serif;
             font-size: 0.95rem;
             font-style: italic;
             font-weight: 300;
             color: #7a7470;
-            margin: 14px 0 14px 0;
+            margin: 12px 0 0 0;
             line-height: 1.6;
             border-top: 1px solid #F0EDE8;
             padding-top: 12px;
         }
-        .shop-btn {
-            display: inline-block;
-            background: #1a1a1a;
-            color: #ffffff !important;
-            text-decoration: none !important;
+        .card-caveat {
             font-family: 'Inter', sans-serif;
-            font-size: 0.72rem;
-            font-weight: 400;
-            letter-spacing: 0.12em;
-            text-transform: uppercase;
-            padding: 11px 20px;
-            border-radius: 4px;
-            transition: background 0.2s;
+            font-size: 0.76rem;
+            color: #b5afa8;
+            margin: 8px 0 0 0;
+            font-weight: 300;
+            font-style: italic;
         }
-        .shop-btn:hover { background: #2e2e2e; }
 
-        /* ── Results page header ── */
+        /* ── Results / intro headers ── */
         .profile-eyebrow {
             font-family: 'Inter', sans-serif;
             font-size: 0.7rem;
@@ -830,21 +585,29 @@ def inject_css():
             letter-spacing: 0.22em;
             text-transform: uppercase;
             color: #9a9490;
-            margin: 4rem 0 1rem 0;
+            margin: 4rem 0 0.75rem 0;
             display: block;
         }
         .profile-name {
             font-family: 'Cormorant Garamond', Georgia, serif;
-            font-size: 3rem;
+            font-size: 2.6rem;
             font-weight: 300;
             color: #1a1a1a;
-            margin: 0 0 1.75rem 0;
-            line-height: 1.1;
+            margin: 0 0 1.5rem 0;
+            line-height: 1.15;
             letter-spacing: 0.03em;
+        }
+        .profile-summary {
+            font-family: 'Inter', sans-serif;
+            font-size: 0.92rem;
+            font-weight: 300;
+            color: #5a5550;
+            margin: 0 0 2.5rem 0;
+            line-height: 1.85;
         }
         .profile-quote {
             font-family: 'Cormorant Garamond', Georgia, serif;
-            font-size: 1.2rem;
+            font-size: 1.15rem;
             font-style: italic;
             font-weight: 300;
             color: #9a9490;
@@ -899,32 +662,26 @@ def inject_css():
             margin-bottom: 3rem;
         }
 
-        /* ── Demographics chip grid ── */
-        .chip-grid {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            margin: 1.5rem 0 2.5rem 0;
+        /* ── Budget slider ── */
+        [data-testid="stSlider"] {
+            padding: 0.5rem 0 1rem 0;
         }
-        .chip {
-            font-family: 'Inter', sans-serif;
-            font-size: 0.82rem;
-            font-weight: 300;
-            color: #5a5550;
-            background: transparent;
-            border: 1px solid #C8C2BB;
-            border-radius: 100px;
-            padding: 9px 20px;
-            cursor: pointer;
-            transition: all 0.15s;
-            letter-spacing: 0.02em;
+        [data-testid="stSlider"] [data-testid="stTickBarMin"],
+        [data-testid="stSlider"] [data-testid="stTickBarMax"] {
+            font-family: 'Inter', sans-serif !important;
+            font-size: 0.75rem !important;
+            font-weight: 300 !important;
+            color: #b5afa8 !important;
         }
-        .chip:hover { border-color: #8a8480; color: #1a1a1a; }
-        .chip.selected {
-            background: #1a1a1a;
-            border-color: #1a1a1a;
-            color: #ffffff;
+        [data-testid="stSlider"] div[role="slider"] {
+            background: #1a1a1a !important;
+            border: none !important;
         }
+        [data-testid="stSlider"] .st-emotion-cache-1jmves9 {
+            background: #1a1a1a !important;
+        }
+
+        /* ── Demographics chip buttons ── */
         .demo-section-label {
             font-family: 'Inter', sans-serif;
             font-size: 0.7rem;
@@ -941,85 +698,64 @@ def inject_css():
     )
 
 
-def _render_stars(rating_str: str) -> str:
-    try:
-        r = float(rating_str)
-        if r <= 0:
-            return ""
-    except (ValueError, TypeError):
-        return ""
-    stars = ""
-    for i in range(5):
-        stars += "★" if r >= i + 0.75 else ("½" if r >= i + 0.25 else "☆")
-    return stars
+# ─────────────────────────────────────────────
+# Result card renderer
+# ─────────────────────────────────────────────
 
+def render_result_card(frag: dict):
+    name      = _html.escape(str(frag.get("name", "")))
+    brand     = _html.escape(str(frag.get("brand", "")))
+    family    = _html.escape(str(frag.get("family", "")))
+    top       = _html.escape(str(frag.get("top_notes", "")))
+    mid       = _html.escape(str(frag.get("middle_notes", "")))
+    base      = _html.escape(str(frag.get("base_notes", "")))
+    why       = _html.escape(str(frag.get("why", "")))
+    pick_type = _html.escape(str(frag.get("pick_type", "")))
+    heat      = _html.escape(str(frag.get("heat_performance", "")))
+    caveat    = _html.escape(str(frag.get("caveat", "")))
 
-def _format_reviews(reviews_str: str) -> str:
-    try:
-        n = int(float(reviews_str))
-        return f"{n/1000:.1f}k reviews" if n >= 1000 else f"{n} reviews"
-    except (ValueError, TypeError):
-        return ""
+    # Normalise price — ensure $ sign is present
+    raw_price = str(frag.get("price", "")).strip()
+    if raw_price and "$" not in raw_price:
+        raw_price = "$" + raw_price
+    price = _html.escape(raw_price)
 
-
-def _format_price(price_str: str) -> str:
-    try:
-        return f"${float(price_str):.2f}"
-    except (ValueError, TypeError):
-        return price_str
-
-
-def render_result_card(row: pd.Series, rank: int, summary: str = ""):
-    """Render one Fragrantica product as a white card with rating, notes, and accords."""
-    import html as _html
-    score_pct = int(row["similarity"] * 100)
-
-    stars   = _render_stars(row.get("rating", ""))
-    reviews = _format_reviews(row.get("reviews", ""))
-
-    meta_html = ""
-    if stars:
-        meta_html = (
-            f'<div class="card-meta">'
-            f'<span class="card-stars">{stars}</span>'
-            f'<span class="card-reviews">{reviews}</span>'
-            f'</div>'
-        )
-
-    notes = _html.escape((row.get("notes", "") or "").strip())
-    notes_html = f'<p class="card-highlights">{notes}</p>' if notes else ""
-
-    accords = _html.escape((row.get("accords", "") or "").strip())
-    accords_html = (
-        f'<p class="card-highlights" style="color:#9a9490;font-size:0.78rem;">{accords}</p>'
-        if accords else ""
+    note_parts = []
+    if top:  note_parts.append(f"Top: {top}")
+    if mid:  note_parts.append(f"Middle: {mid}")
+    if base: note_parts.append(f"Base: {base}")
+    notes_html = (
+        f'<p class="card-notes">{"  ·  ".join(note_parts)}</p>'
+        if note_parts else ""
     )
 
-    safe_summary = _html.escape(summary) if summary else ""
-    community_html = f'<p class="card-community">{safe_summary}</p>' if safe_summary else ""
-
-    url = (row.get("url", "") or "").strip()
-    link_html = (
-        f'<a class="shop-btn" href="{_html.escape(url)}" target="_blank" rel="noopener">View on Fragrantica →</a>'
-        if url else ""
+    meta_html = (
+        f'<p class="card-meta">{price}  ·  Usually found on FragranceNet</p>'
+        if price else
+        '<p class="card-meta">Usually found on FragranceNet</p>'
     )
 
-    name  = _html.escape(str(row["name"]))
-    brand = _html.escape(str(row["brand"]))
+    pick_class = "signature" if "signature" in pick_type.lower() else ""
+    pick_html  = f'<span class="card-pick-type {pick_class}">{pick_type}</span>' if pick_type else ""
+    family_html = f'<p class="card-family">{family}</p>' if family else ""
+    heat_html   = f'<p class="card-heat">Heat: {heat}</p>' if heat else ""
+    why_html    = f'<p class="card-why">{why}</p>' if why else ""
+    caveat_html = f'<p class="card-caveat">Note: {caveat}</p>' if caveat else ""
 
     st.markdown(
         f"""
         <div class="result-card">
             <div class="card-top">
                 <p class="card-name">{name}</p>
-                <span class="card-rank">{score_pct}% match</span>
+                {pick_html}
             </div>
             <p class="card-brand">{brand}</p>
-            {meta_html}
+            {family_html}
             {notes_html}
-            {accords_html}
-            {community_html}
-            {link_html}
+            {meta_html}
+            {heat_html}
+            {why_html}
+            {caveat_html}
         </div>
         """,
         unsafe_allow_html=True,
@@ -1031,34 +767,97 @@ def render_result_card(row: pd.Series, rank: int, summary: str = ""):
 # ─────────────────────────────────────────────
 
 def show_intro():
-    """Landing / intro screen."""
     st.markdown(
         """
         <span class="hero-wordmark">ScentMatch</span>
         <p class="hero-title">Find your<br>fragrance.</p>
         <p class="hero-sub">
-            Answer nine questions about who you are.<br>
+            Answer a few questions about who you are.<br>
             We'll match you to a fragrance using AI.
         </p>
         <p class="hero-meta">
-            Nine questions &nbsp;·&nbsp; Two minutes &nbsp;·&nbsp; No account needed
+            12 questions &nbsp;·&nbsp; Three minutes &nbsp;·&nbsp; No account needed
         </p>
         """,
         unsafe_allow_html=True,
     )
-
     if st.button("Begin", type="primary", use_container_width=True):
         st.session_state.step = 1
-        st.session_state.answers = [None] * 9
+        st.session_state.occasions = []
+        st.session_state.answers = [None] * 11
+        st.rerun()
+
+
+def show_occasions():
+    """Phase 0 — single-select occasion question."""
+    st.progress(1 / TOTAL_STEPS)
+    st.markdown('<span class="step-label">What are you shopping for?</span>', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="quiz-question">What\'s the occasion?</p>',
+        unsafe_allow_html=True,
+    )
+
+    if "occasions" not in st.session_state:
+        st.session_state.occasions = []
+
+    current = st.session_state.occasions[0] if st.session_state.occasions else None
+    current_idx = PHASE0_OCCASIONS.index(current) if current in PHASE0_OCCASIONS else None
+
+    choice = st.radio(
+        "occasion",
+        PHASE0_OCCASIONS,
+        index=current_idx,
+        key="occ_radio",
+        label_visibility="collapsed",
+    )
+
+    import streamlit.components.v1 as components
+    components.html(
+        """
+        <script>
+        (function() {
+            function setActive(btn, active) {
+                btn.disabled = !active;
+                if (active) {
+                    btn.style.setProperty('background', '#1a1a1a', 'important');
+                    btn.style.setProperty('color', '#ffffff', 'important');
+                    btn.style.setProperty('cursor', 'pointer', 'important');
+                    btn.style.setProperty('opacity', '1', 'important');
+                } else {
+                    btn.style.setProperty('background', '#ccc8c3', 'important');
+                    btn.style.setProperty('color', '#f0ede9', 'important');
+                    btn.style.setProperty('cursor', 'not-allowed', 'important');
+                }
+            }
+            function wire(attempts) {
+                if (attempts <= 0) return;
+                var doc = window.parent.document;
+                var radios = doc.querySelectorAll('[data-testid="stRadio"] input[type="radio"]');
+                var btn = Array.from(doc.querySelectorAll('button[kind="primary"]'))
+                              .find(function(b) { return /Continue/.test(b.textContent); });
+                if (!radios.length || !btn) { setTimeout(function(){ wire(attempts-1); }, 100); return; }
+                var anyChecked = Array.from(radios).some(function(r) { return r.checked; });
+                setActive(btn, anyChecked);
+                radios.forEach(function(r) {
+                    r.addEventListener('change', function() { setActive(btn, true); });
+                });
+            }
+            wire(30);
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
+    st.markdown("<div style='height:2rem'></div>", unsafe_allow_html=True)
+
+    if st.button("Continue", disabled=choice is None, type="primary", use_container_width=True):
+        st.session_state.occasions = [choice]
+        st.session_state.step = 2
         st.rerun()
 
 
 def _submit_text(step: int, idx: int):
-    """
-    on_change callback for text questions.
-    Fires when the user presses Enter (or blurs the field).
-    If the field has content, save the answer and advance to the next step.
-    """
     val = st.session_state.get(f"q{step}_text", "").strip()
     if val:
         st.session_state.answers[idx] = val
@@ -1066,51 +865,65 @@ def _submit_text(step: int, idx: int):
 
 
 def show_question(step: int):
-    """Render a single quiz question (step = 1..9)."""
-    q = QUESTIONS[step - 1]
-    idx = step - 1
+    """Phase 1 questions — steps 2 through 16."""
+    q_idx = step - 2          # 0-based index into PHASE1_QUESTIONS
+    q     = PHASE1_QUESTIONS[q_idx]
+    total_q_steps = len(PHASE1_QUESTIONS)  # 15
 
-    # Thin progress line pinned to top of viewport
-    st.progress((step - 1) / 9)
-
+    # step 1 = occasions, step 2 = q1, ..., step 16 = q15, step 17 = demo
+    st.progress(step / TOTAL_STEPS)
+    display_num = q_idx + 1
     st.markdown(
-        f'<span class="step-label">{step} &nbsp;/&nbsp; 9</span>',
+        f'<span class="step-label">{display_num} &nbsp;/&nbsp; {total_q_steps}</span>',
         unsafe_allow_html=True,
     )
     st.markdown(f'<p class="quiz-question">{q["label"]}</p>', unsafe_allow_html=True)
 
-    # ── Input widget ──
     answered = False
 
     if q["type"] == "text":
         val = st.text_input(
             "your answer",
-            placeholder=q["placeholder"],
+            placeholder=q.get("placeholder", ""),
             key=f"q{step}_text",
             label_visibility="collapsed",
             on_change=_submit_text,
-            args=(step, idx),
+            args=(step, q_idx),
         )
         answered = bool(val.strip())
 
-        # Enable Continue button as soon as user types — no Enter required
         import streamlit.components.v1 as components
         components.html(
             """
             <script>
             (function() {
+                function setActive(btn, active) {
+                    btn.disabled = !active;
+                    if (active) {
+                        btn.style.setProperty('background', '#1a1a1a', 'important');
+                        btn.style.setProperty('color', '#ffffff', 'important');
+                        btn.style.setProperty('cursor', 'pointer', 'important');
+                        btn.style.setProperty('opacity', '1', 'important');
+                    } else {
+                        btn.style.setProperty('background', '#ccc8c3', 'important');
+                        btn.style.setProperty('color', '#f0ede9', 'important');
+                        btn.style.setProperty('cursor', 'not-allowed', 'important');
+                    }
+                }
                 function wire(attempts) {
                     if (attempts <= 0) return;
                     var doc = window.parent.document;
                     var inp = doc.querySelector('[data-testid="stTextInput"] input');
                     var btn = Array.from(doc.querySelectorAll('button[kind="primary"]'))
                                   .find(function(b) {
-                                      return /Continue|See my matches/.test(b.textContent);
+                                      return /Continue|Almost there/.test(b.textContent);
                                   });
                     if (!inp || !btn) { setTimeout(function(){ wire(attempts-1); }, 100); return; }
                     inp.addEventListener('input', function() {
-                        btn.disabled = inp.value.trim().length === 0;
+                        setActive(btn, inp.value.trim().length > 0);
                     });
+                    // set initial state
+                    setActive(btn, inp.value.trim().length > 0);
                 }
                 wire(30);
             })();
@@ -1118,8 +931,7 @@ def show_question(step: int):
             """,
             height=0,
         )
-
-    else:  # multiple choice
+    elif q["type"] == "choice":
         choice = st.radio(
             "pick one",
             q["options"],
@@ -1129,110 +941,140 @@ def show_question(step: int):
         )
         answered = choice is not None
 
+    else:  # "multi"
+        multi_key = f"q{step}_multi"
+        if multi_key not in st.session_state:
+            st.session_state[multi_key] = set()
+        selected = st.session_state[multi_key]
+        for opt in q["options"]:
+            if st.checkbox(opt, value=(opt in selected), key=f"{multi_key}_{opt}"):
+                selected.add(opt)
+            else:
+                selected.discard(opt)
+        st.session_state[multi_key] = selected
+        answered = len(selected) > 0
+
     st.markdown("<div style='height:2rem'></div>", unsafe_allow_html=True)
 
-    # ── Continue button (full width, primary) ──
-    label = "See my matches" if step == 9 else "Continue"
-    if st.button(label, disabled=not answered, type="primary", use_container_width=True):
+    is_last = (step == 2 + len(PHASE1_QUESTIONS) - 1)
+    btn_label = "Almost there" if is_last else "Continue"
+
+    if st.button(btn_label, disabled=not answered, type="primary", use_container_width=True):
         if q["type"] == "text":
-            st.session_state.answers[idx] = st.session_state.get(f"q{step}_text", "").strip()
-        else:
-            st.session_state.answers[idx] = st.session_state.get(f"q{step}_choice")
+            st.session_state.answers[q_idx] = st.session_state.get(f"q{step}_text", "").strip()
+        elif q["type"] == "choice":
+            st.session_state.answers[q_idx] = st.session_state.get(f"q{step}_choice")
+        else:  # multi
+            picked = st.session_state.get(f"q{step}_multi", set())
+            st.session_state.answers[q_idx] = ", ".join(sorted(picked))
         st.session_state.step = step + 1
         st.rerun()
 
-    # ── Skip link — centered text below, no box ──
-    _, col_mid, _ = st.columns([2, 1, 2])
-    with col_mid:
-        if st.button("skip", key=f"skip_{step}", use_container_width=True):
-            st.session_state.answers[idx] = ""
-            st.session_state.step = step + 1
-            st.rerun()
+    if q.get("skippable"):
+        _, col_mid, _ = st.columns([2, 1, 2])
+        with col_mid:
+            if st.button("skip", key=f"skip_{step}", use_container_width=True):
+                st.session_state.answers[q_idx] = ""
+                st.session_state.step = step + 1
+                st.rerun()
 
 
 def show_demographics():
-    """Step 10: two quick chip questions before results."""
-    st.progress(1.0)
+    """Step 13 — age, budget, gender."""
+    st.progress(13 / TOTAL_STEPS)
     st.markdown('<span class="step-label">Almost there</span>', unsafe_allow_html=True)
-    st.markdown('<p class="quiz-question">One last thing — help us personalise your results.</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="quiz-question">One last thing — help us personalise your results.</p>',
+        unsafe_allow_html=True,
+    )
 
-    age_options    = ["18-24", "25-34", "35-44", "45+"]
+    age_options    = ["18–24", "25–34", "35–44", "45+"]
     gender_options = ["Men's", "Women's", "Show me everything"]
 
-    age    = st.session_state.get("demo_age", None)
-    gender = st.session_state.get("demo_gender", None)
+    age    = st.session_state.get("demo_age")
+    gender = st.session_state.get("demo_gender")
 
-    # Age chips
     st.markdown('<span class="demo-section-label">How old are you?</span>', unsafe_allow_html=True)
     age_cols = st.columns(len(age_options))
     for i, opt in enumerate(age_options):
-        selected = age == opt
-        label = f"**{opt}**" if selected else opt
-        if age_cols[i].button(opt, key=f"age_{opt}", type="primary" if selected else "secondary", use_container_width=True):
+        if age_cols[i].button(opt, key=f"age_{opt}", type="primary" if age == opt else "secondary", use_container_width=True):
             st.session_state.demo_age = opt
             st.rerun()
 
-    # Gender chips
+    st.markdown('<span class="demo-section-label">Budget per bottle (USD)</span>', unsafe_allow_html=True)
+    budget_range = st.slider(
+        "budget",
+        min_value=20,
+        max_value=500,
+        value=st.session_state.get("demo_budget_range", (50, 150)),
+        step=10,
+        label_visibility="collapsed",
+        format="$%d",
+    )
+    st.session_state.demo_budget_range = budget_range
+    budget_str = f"${budget_range[0]}–${budget_range[1]}"
+    st.session_state.demo_budget = budget_str
+
     st.markdown('<span class="demo-section-label">Which fragrances should we focus on?</span>', unsafe_allow_html=True)
     gender_cols = st.columns(len(gender_options))
     for i, opt in enumerate(gender_options):
-        selected = gender == opt
-        if gender_cols[i].button(opt, key=f"gender_{opt}", type="primary" if selected else "secondary", use_container_width=True):
+        if gender_cols[i].button(opt, key=f"gender_{opt}", type="primary" if gender == opt else "secondary", use_container_width=True):
             st.session_state.demo_gender = opt
             st.rerun()
 
     st.markdown("<div style='height:2rem'></div>", unsafe_allow_html=True)
 
+    # budget always has a value (slider), so only gate on age + gender
     ready = age is not None and gender is not None
     if st.button("See my matches", disabled=not ready, type="primary", use_container_width=True):
-        st.session_state.step = 11
+        st.session_state.step = 14
         st.rerun()
 
 
-def show_results(df: pd.DataFrame, embeddings: np.ndarray):
-    """Results page: profile name, Q9 quote, recommendation cards, start-over."""
-    answers = st.session_state.answers
+def show_results():
+    occasions = st.session_state.get("occasions", [])
+    answers   = st.session_state.get("answers", [None] * 11)
+    age       = st.session_state.get("demo_age", "25–34")
+    budget    = st.session_state.get("demo_budget", "$50–$150")
+    gender    = st.session_state.get("demo_gender", "Show me everything")
 
-    age    = st.session_state.get("demo_age", "25-34")
-    gender = st.session_state.get("demo_gender", "Show me everything")
+    st.markdown('<span class="profile-eyebrow">Your fragrance profile</span>', unsafe_allow_html=True)
 
-    # Compile query and run recommendation (cached in session_state)
-    query    = compile_query(answers, age=age)
-    cache_key = f"{query}|{gender}"
-    if st.session_state.get("results_query") != cache_key:
-        with st.spinner("Finding your matches…"):
-            st.session_state.results_df    = recommend(query, df, embeddings, gender=gender, top_k=TOP_K)
-            st.session_state.results_query = cache_key
+    cache_key = f"{occasions}|{answers}|{age}|{budget}|{gender}"
+    if st.session_state.get("results_key") != cache_key:
+        with st.spinner("Reading your answers..."):
+            try:
+                profile_summary, fragrances = get_gemini_recommendations(
+                    occasions, answers, age, budget, gender
+                )
+                st.session_state.results_profile = profile_summary
+                st.session_state.results_data    = fragrances
+                st.session_state.results_key     = cache_key
+                st.session_state.results_error   = None
+            except Exception as e:
+                st.session_state.results_profile = None
+                st.session_state.results_data    = None
+                st.session_state.results_key     = None
+                st.session_state.results_error   = str(e)
 
-    results = st.session_state.results_df
-    profile = derive_scent_profile(answers)
-    q9      = (answers[8] or "").strip()
+    if st.session_state.get("results_error"):
+        st.error("Something went wrong finding your matches. Please try again.")
+        if st.button("Try again", type="primary", use_container_width=True):
+            st.session_state.results_error = None
+            st.rerun()
+        return
 
-    # ── Profile header ──
-    st.markdown(
-        f'<span class="profile-eyebrow">Your scent profile</span>'
-        f'<p class="profile-name">{profile}</p>',
-        unsafe_allow_html=True,
-    )
-
-    if q9:
+    profile_summary = st.session_state.get("results_profile", "")
+    if profile_summary:
         st.markdown(
-            f'<p class="profile-quote">"I want to smell like someone who {q9}"</p>',
+            f'<p class="profile-summary">{_html.escape(profile_summary)}</p>',
             unsafe_allow_html=True,
         )
 
-    st.markdown(
-        '<span class="results-eyebrow">Your matches</span>',
-        unsafe_allow_html=True,
-    )
+    st.markdown('<span class="results-eyebrow">Your matches</span>', unsafe_allow_html=True)
 
-    # ── Fetch community summaries (parallel, cached in session_state) ──
-    with st.spinner("Gathering community insights…"):
-        summaries = fetch_all_summaries(results)
-
-    # ── Result cards ──
-    for rank, (_, row) in enumerate(results.iterrows(), start=1):
-        render_result_card(row, rank, summaries.get(row["name"], ""))
+    for frag in st.session_state.get("results_data", []):
+        render_result_card(frag)
 
     st.markdown("<div style='height:2.5rem'></div>", unsafe_allow_html=True)
 
@@ -1252,32 +1094,24 @@ def main():
         layout="centered",
     )
     inject_css()
-    st.markdown("""
-<script>
-document.querySelectorAll('input, textarea').forEach(el => {
-    el.setAttribute('autocomplete', 'off');
-});
-</script>
-""", unsafe_allow_html=True)
 
-    # Load data + embeddings (from cache file if available, else compute once)
-    df, embeddings = load_data_and_embeddings()
-
-    # Initialise quiz state on first load
     if "step" not in st.session_state:
         st.session_state.step    = 0
-        st.session_state.answers = [None] * 9
+        st.session_state.answers = [None] * 11
+        st.session_state.occasions = []
 
     step = st.session_state.step
 
     if step == 0:
         show_intro()
-    elif 1 <= step <= 9:
+    elif step == 1:
+        show_occasions()
+    elif 2 <= step <= 12:
         show_question(step)
-    elif step == 10:
+    elif step == 13:
         show_demographics()
     else:
-        show_results(df, embeddings)
+        show_results()
 
 
 if __name__ == "__main__":
