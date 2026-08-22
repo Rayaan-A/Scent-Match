@@ -246,7 +246,12 @@ def _build_prompt(occasions, answers, age, budget, gender):
 
 
 def get_gemini_recommendations(occasions, answers, age, budget, gender):
-    api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        try:
+            api_key = st.secrets["GEMINI_API_KEY"]
+        except (KeyError, FileNotFoundError):
+            api_key = ""
     if not api_key:
         raise ValueError("GEMINI_API_KEY not configured")
 
