@@ -6,13 +6,17 @@ Quiz flow:
   step 1  : Phase 0 — occasion multi-select
   steps 2-12 : Phase 1 — 11 personality questions
   step 13 : demographics (age / budget / gender)
-  step 14 : results (Gemini recommendations)
+  step 14 : email capture (background API call running)
+  step 15 : results
 """
 
 import html as _html
 import json
 import os
 import re
+import threading
+import time
+import uuid
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -22,6 +26,32 @@ from google.genai import types
 load_dotenv()
 
 TOTAL_STEPS = 13  # steps 1-13 are quiz/demo; used for progress bar
+
+# ─────────────────────────────────────────────
+# Background result store (module-level, persists across reruns)
+# ─────────────────────────────────────────────
+
+# Streamlit exec()s the script into a BRAND NEW module namespace on every rerun
+# (ScriptRunner._run_script -> _new_module("__main__")). Plain module-level
+# globals therefore do NOT persist across reruns - they are reset to their
+# initial value each time, so a background thread would write its result into a
+# dict that the next rerun can no longer see, and the results page would poll
+# forever. @st.cache_resource returns the same object across reruns, which is
+# what actually gives us a stable place to hand results back to.
+@st.cache_resource
+def _bg_store() -> dict:
+    return {"results": {}, "lock": threading.Lock()}
+
+
+def _run_in_background(store: dict, request_id: str, api_key: str, occasions, answers, age, budget, gender):
+    try:
+        profile, frags = get_gemini_recommendations(occasions, answers, age, budget, gender, api_key=api_key)
+        payload = {"profile": profile, "frags": frags, "error": None}
+    except Exception as e:
+        payload = {"profile": None, "frags": None, "error": str(e)}
+    with store["lock"]:
+        store["results"][request_id] = payload
+
 
 # ─────────────────────────────────────────────
 # Quiz definitions
@@ -245,27 +275,78 @@ def _build_prompt(occasions, answers, age, budget, gender):
     )
 
 
-def get_gemini_recommendations(occasions, answers, age, budget, gender):
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
+# gemini-flash-latest sheds load under demand (503s). The SDK silently retries
+# 429/500/503 five times with exponential backoff, which is what turned a ~12s
+# call into a 2-3 minute spinner. Pin the model and cap the retries so a bad
+# minute fails fast instead of hanging the user.
+# Model choice is a quality decision, not just a speed one. flash-lite answers in
+# ~3s but ignores the BUDGET RULE in _SYSTEM_PROMPT (~1 in 3 picks came back over
+# the user's stated ceiling, rationalised with "buy a decant"). gemini-3.6-flash
+# takes ~15s and respected the ceiling on every pick, so it wins here.
+# Tradeoff: free tier allows only 20 requests/day for this model.
+_MODEL = "gemini-3.6-flash"
+
+_HTTP_OPTIONS = types.HttpOptions(
+    timeout=45_000,  # milliseconds
+    retry_options=types.HttpRetryOptions(attempts=2, initial_delay=1.0, max_delay=4.0),
+)
+
+
+def _friendly_error(err: str) -> str:
+    """Turn raw Gemini API errors into something a visitor can read."""
+    e = err or ""
+    if "RESOURCE_EXHAUSTED" in e or "429" in e:
+        return (
+            "We're getting more requests than our current plan allows. "
+            "This resets daily - please try again later."
+        )
+    if "UNAVAILABLE" in e or "503" in e:
+        return "The recommendation service is busy right now. Give it a moment and try again."
+    if "DEADLINE" in e or "timeout" in e.lower():
+        return "That took longer than expected. Please try again."
+    if "GEMINI_API_KEY" in e:
+        return "The app isn't configured correctly. (Missing API key.)"
+    return "Something went wrong finding your matches. Please try again."
+
+
+def _resolve_api_key(api_key: str = "") -> str:
+    if api_key:
+        return api_key
+    key = os.environ.get("GEMINI_API_KEY", "")
+    if not key:
         try:
-            api_key = st.secrets["GEMINI_API_KEY"]
+            key = st.secrets["GEMINI_API_KEY"]
         except (KeyError, FileNotFoundError):
-            api_key = ""
+            key = ""
+    return key
+
+
+def get_gemini_recommendations(occasions, answers, age, budget, gender, api_key: str = ""):
+    api_key = _resolve_api_key(api_key)
     if not api_key:
         raise ValueError("GEMINI_API_KEY not configured")
 
     prompt = _build_prompt(occasions, answers, age, budget, gender)
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key, http_options=_HTTP_OPTIONS)
     response = client.models.generate_content(
-        model="gemini-flash-latest",
+        model=_MODEL,
         config=types.GenerateContentConfig(
             system_instruction=_SYSTEM_PROMPT,
             temperature=0.7,
+            # Thinking tokens count against max_output_tokens. The JSON payload
+            # alone is ~700 tokens, so a 1500 cap left nothing for the answer and
+            # every response came back truncated (finish_reason=MAX_TOKENS).
+            # Thinking tokens share this budget; ~950 thinking + ~720 output observed.
+            max_output_tokens=4096,
+            thinking_config=types.ThinkingConfig(thinking_level="low"),
+            response_mime_type="application/json",
         ),
         contents=prompt,
     )
-    raw = response.text.strip()
+    if response.candidates and response.candidates[0].finish_reason.name != "STOP":
+        raise RuntimeError(f"model stopped early: {response.candidates[0].finish_reason.name}")
+
+    raw = (response.text or "").strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     parsed = json.loads(raw)
@@ -283,9 +364,9 @@ def reset_quiz():
         "step", "occasions", "answers",
         "demo_age", "demo_budget", "demo_budget_range", "demo_gender",
         "results_profile", "results_data", "results_key", "results_error",
+        "bg_request_id", "user_email",
     ]:
         st.session_state.pop(key, None)
-    # also clear per-question widget keys
     for i in range(1, 14):
         st.session_state.pop(f"q{i}_text", None)
         st.session_state.pop(f"q{i}_choice", None)
@@ -697,10 +778,82 @@ def inject_css():
             margin: 2rem 0 0.5rem 0;
             display: block;
         }
+
+        /* ── Skeleton loading ── */
+        @keyframes shimmer {
+            0%   { background-position: -600px 0; }
+            100% { background-position:  600px 0; }
+        }
+        .skeleton {
+            background: linear-gradient(90deg, #d4cec7 25%, #e8e2db 50%, #d4cec7 75%);
+            background-size: 600px 100%;
+            animation: shimmer 1.4s ease-in-out infinite;
+            border-radius: 6px;
+        }
+        .skeleton-card {
+            background: #ffffff;
+            border-radius: 12px;
+            padding: 24px 26px 20px 26px;
+            margin-bottom: 16px;
+            box-shadow: 0 1px 10px rgba(0,0,0,0.06), 0 0 1px rgba(0,0,0,0.04);
+        }
+        .sk-title    { height: 22px; width: 55%; margin-bottom: 10px; }
+        .sk-badge    { height: 10px; width: 18%; margin-bottom: 14px; }
+        .sk-brand    { height: 10px; width: 30%; margin-bottom: 16px; }
+        .sk-line     { height: 10px; width: 100%; margin-bottom: 8px; }
+        .sk-line-sm  { height: 10px; width: 70%; margin-bottom: 8px; }
+        .sk-line-med { height: 10px; width: 85%; margin-bottom: 8px; }
+        .sk-divider  { height: 1px; background: #F0EDE8; margin: 14px 0; }
+        .sk-para     { height: 10px; margin-bottom: 6px; }
+
+        .skeleton-profile-title { height: 16px; width: 40%; margin-bottom: 18px; }
+        .skeleton-profile-line  { height: 12px; margin-bottom: 10px; }
         </style>
         """,
         unsafe_allow_html=True,
     )
+
+
+# ─────────────────────────────────────────────
+# Skeleton loaders
+# ─────────────────────────────────────────────
+
+def render_skeleton_card():
+    st.markdown(
+        """
+        <div class="skeleton-card">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px">
+                <div class="skeleton sk-title"></div>
+                <div class="skeleton sk-badge"></div>
+            </div>
+            <div class="skeleton sk-brand"></div>
+            <div class="skeleton sk-line"></div>
+            <div class="skeleton sk-line-med"></div>
+            <div class="skeleton sk-line-sm"></div>
+            <div class="sk-divider"></div>
+            <div class="skeleton sk-para" style="width:100%"></div>
+            <div class="skeleton sk-para" style="width:88%"></div>
+            <div class="skeleton sk-para" style="width:74%"></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_skeleton_results():
+    st.markdown('<span class="profile-eyebrow">Your fragrance profile</span>', unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div style="margin-bottom:2.5rem">
+            <div class="skeleton skeleton-profile-line" style="width:100%"></div>
+            <div class="skeleton skeleton-profile-line" style="width:82%"></div>
+        </div>
+        <span class="results-eyebrow">Your matches</span>
+        """,
+        unsafe_allow_html=True,
+    )
+    for _ in range(3):
+        render_skeleton_card()
 
 
 # ─────────────────────────────────────────────
@@ -719,7 +872,6 @@ def render_result_card(frag: dict):
     heat      = _html.escape(str(frag.get("heat_performance", "")))
     caveat    = _html.escape(str(frag.get("caveat", "")))
 
-    # Normalise price — ensure $ sign is present
     raw_price = str(frag.get("price", "")).strip()
     if raw_price and "$" not in raw_price:
         raw_price = "$" + raw_price
@@ -875,7 +1027,6 @@ def show_question(step: int):
     q     = PHASE1_QUESTIONS[q_idx]
     total_q_steps = len(PHASE1_QUESTIONS)  # 15
 
-    # step 1 = occasions, step 2 = q1, ..., step 16 = q15, step 17 = demo
     st.progress(step / TOTAL_STEPS)
     display_num = q_idx + 1
     st.markdown(
@@ -927,7 +1078,6 @@ def show_question(step: int):
                     inp.addEventListener('input', function() {
                         setActive(btn, inp.value.trim().length > 0);
                     });
-                    // set initial state
                     setActive(btn, inp.value.trim().length > 0);
                 }
                 wire(30);
@@ -1029,47 +1179,78 @@ def show_demographics():
 
     st.markdown("<div style='height:2rem'></div>", unsafe_allow_html=True)
 
-    # budget always has a value (slider), so only gate on age + gender
     ready = age is not None and gender is not None
     if st.button("See my matches", disabled=not ready, type="primary", use_container_width=True):
+        # Resolve API key on main thread before spawning background thread
+        occasions = st.session_state.get("occasions", [])
+        answers   = st.session_state.get("answers", [None] * 11)
+        api_key   = _resolve_api_key()
+        request_id = str(uuid.uuid4())
+        st.session_state.bg_request_id = request_id
+        t = threading.Thread(
+            target=_run_in_background,
+            args=(_bg_store(), request_id, api_key, occasions, answers, age, budget_str, gender),
+            daemon=True,
+        )
+        t.start()
         st.session_state.step = 14
         st.rerun()
 
 
+def show_email():
+    """Step 14 — email capture while API runs in background."""
+    st.markdown(
+        """
+        <span class="step-label" style="margin-top:3.5rem;display:block">Almost ready</span>
+        <p class="quiz-question">Where should we send your matches?</p>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    email = st.text_input(
+        "email",
+        placeholder="your@email.com",
+        key="email_input",
+        label_visibility="collapsed",
+    )
+
+    st.markdown("<div style='height:1.5rem'></div>", unsafe_allow_html=True)
+
+    valid = "@" in email and "." in email.split("@")[-1]
+    if st.button("See my matches", disabled=not valid, type="primary", use_container_width=True):
+        st.session_state.user_email = email.strip()
+        st.session_state.step = 15
+        st.rerun()
+
+
 def show_results():
-    occasions = st.session_state.get("occasions", [])
-    answers   = st.session_state.get("answers", [None] * 11)
-    age       = st.session_state.get("demo_age", "25–34")
-    budget    = st.session_state.get("demo_budget", "$50–$150")
-    gender    = st.session_state.get("demo_gender", "Show me everything")
+    request_id = st.session_state.get("bg_request_id")
+    store = _bg_store()
 
-    st.markdown('<span class="profile-eyebrow">Your fragrance profile</span>', unsafe_allow_html=True)
+    with store["lock"]:
+        result = store["results"].get(request_id)
 
-    cache_key = f"{occasions}|{answers}|{age}|{budget}|{gender}"
-    if st.session_state.get("results_key") != cache_key:
-        with st.spinner("Reading your answers..."):
-            try:
-                profile_summary, fragrances = get_gemini_recommendations(
-                    occasions, answers, age, budget, gender
-                )
-                st.session_state.results_profile = profile_summary
-                st.session_state.results_data    = fragrances
-                st.session_state.results_key     = cache_key
-                st.session_state.results_error   = None
-            except Exception as e:
-                st.session_state.results_profile = None
-                st.session_state.results_data    = None
-                st.session_state.results_key     = None
-                st.session_state.results_error   = str(e)
+    if result is None:
+        # Still loading — show skeletons and poll
+        render_skeleton_results()
+        time.sleep(0.6)
+        st.rerun()
+        return
 
-    if st.session_state.get("results_error"):
-        st.error("Something went wrong finding your matches. Please try again.")
+    if result["error"]:
+        st.markdown('<span class="profile-eyebrow">Your fragrance profile</span>', unsafe_allow_html=True)
+        st.error(_friendly_error(result["error"]))
         if st.button("Try again", type="primary", use_container_width=True):
-            st.session_state.results_error = None
+            with store["lock"]:
+                store["results"].pop(request_id, None)
+            st.session_state.pop("bg_request_id", None)
+            st.session_state.step = 13
             st.rerun()
         return
 
-    profile_summary = st.session_state.get("results_profile", "")
+    st.markdown('<span class="profile-eyebrow">Your fragrance profile</span>', unsafe_allow_html=True)
+
+    profile_summary = result["profile"]
     if profile_summary:
         st.markdown(
             f'<p class="profile-summary">{_html.escape(profile_summary)}</p>',
@@ -1078,12 +1259,14 @@ def show_results():
 
     st.markdown('<span class="results-eyebrow">Your matches</span>', unsafe_allow_html=True)
 
-    for frag in st.session_state.get("results_data", []):
+    for frag in result["frags"] or []:
         render_result_card(frag)
 
     st.markdown("<div style='height:2.5rem'></div>", unsafe_allow_html=True)
 
     if st.button("Start over", use_container_width=True):
+        with store["lock"]:
+            store["results"].pop(request_id, None)
         reset_quiz()
         st.rerun()
 
@@ -1115,6 +1298,8 @@ def main():
         show_question(step)
     elif step == 13:
         show_demographics()
+    elif step == 14:
+        show_email()
     else:
         show_results()
 
