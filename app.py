@@ -370,6 +370,12 @@ def reset_quiz():
     for i in range(1, 14):
         st.session_state.pop(f"q{i}_text", None)
         st.session_state.pop(f"q{i}_choice", None)
+        multi_key = f"q{i}_multi"
+        st.session_state.pop(multi_key, None)
+        for q in PHASE1_QUESTIONS:
+            if q["type"] == "multi":
+                for opt in q["options"]:
+                    st.session_state.pop(f"{multi_key}_{opt}", None)
     st.session_state.pop("occ_radio", None)
 
 
