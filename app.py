@@ -284,7 +284,7 @@ def _build_prompt(occasions, answers, age, budget, gender):
 # the user's stated ceiling, rationalised with "buy a decant"). gemini-3.6-flash
 # takes ~15s and respected the ceiling on every pick, so it wins here.
 # Tradeoff: free tier allows only 20 requests/day for this model.
-_MODEL = "gemini-3.6-flash"
+_MODEL = "gemini-2.0-flash"
 
 _HTTP_OPTIONS = types.HttpOptions(
     timeout=45_000,  # milliseconds
