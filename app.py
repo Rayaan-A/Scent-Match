@@ -1245,6 +1245,7 @@ def show_results():
     if result["error"]:
         st.markdown('<span class="profile-eyebrow">Your fragrance profile</span>', unsafe_allow_html=True)
         st.error(_friendly_error(result["error"]))
+        st.caption(f"Debug: {result['error'][:300]}")
         if st.button("Try again", type="primary", use_container_width=True):
             with store["lock"]:
                 store["results"].pop(request_id, None)
