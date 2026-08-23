@@ -338,7 +338,6 @@ def get_gemini_recommendations(occasions, answers, age, budget, gender, api_key:
             # every response came back truncated (finish_reason=MAX_TOKENS).
             # Thinking tokens share this budget; ~950 thinking + ~720 output observed.
             max_output_tokens=4096,
-            thinking_config=types.ThinkingConfig(thinking_level="low"),
             response_mime_type="application/json",
         ),
         contents=prompt,
